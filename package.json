@@ -1,6 +1,6 @@
 {
   "name": "cli-chat-app",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Conversational AI Chat App - Beautiful markdown rendering for Claude, Codex and more",
   "main": "main.js",
   "scripts": {
