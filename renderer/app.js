@@ -28,8 +28,12 @@
                 diff: typeof item?.diff === 'string' ? item.diff : '',
               }))
               .filter(item => item.file && item.diff)
-              .slice(0, 12)
             : [];
+          const actualCodeDiffsFetchedAt = Number.isFinite(Number(msg.actualCodeDiffsFetchedAt))
+            ? Number(msg.actualCodeDiffsFetchedAt)
+            : (actualCodeDiffs.length > 0
+              ? (Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now())
+              : 0);
           return {
             id: typeof msg.id === 'string' && msg.id ? msg.id : `msg_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
             role: msg.role === 'user' || msg.role === 'error' ? msg.role : 'ai',
@@ -37,6 +41,7 @@
             profileId: 'codex',
             timestamp: Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now(),
             actualCodeDiffs,
+            actualCodeDiffsFetchedAt,
           };
         });
       const cwd = typeof item.cwd === 'string' ? item.cwd : '';
@@ -407,49 +412,71 @@
     return plus > 0 && minus > 0 && (plus + minus) >= 3;
   }
 
-  function classifyDiffLineForRender(rawLine) {
+  function classifyDiffLineForRender(rawLine, state) {
     const line = String(rawLine ?? '');
     const trimmed = line.trim();
+    const renderState = state || { oldLine: null, newLine: null };
 
     if (/^(?:diff --git|diff --cc|diff --combined)\b/i.test(trimmed)
       || /^\*{3}\s*(?:Update|Add|Delete)\s+File:/i.test(trimmed)
       || /^\*{3}\s*Move to:/i.test(trimmed)) {
-      return { className: 'diff-file-header', sign: '', text: line };
+      renderState.oldLine = null;
+      renderState.newLine = null;
+      return { className: 'diff-file-header', sign: '', text: line, lineNumber: '' };
     }
 
     if (isLikelyDiffMetaLine(trimmed)) {
-      if (/^---\s+/.test(line)) return { className: 'diff-meta', sign: '---', text: line.slice(4) };
-      if (/^\+\+\+\s+/.test(line)) return { className: 'diff-meta', sign: '+++', text: line.slice(4) };
-      if (/^@@/.test(line)) return { className: 'diff-meta', sign: '@@', text: line.replace(/^@@+\s*/, '') };
-      return { className: 'diff-meta', sign: '', text: line };
+      const hunk = /^@@+\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/.exec(line);
+      if (hunk) {
+        const oldStart = Number(hunk[1]);
+        const newStart = Number(hunk[2]);
+        renderState.oldLine = Number.isFinite(oldStart) ? oldStart : null;
+        renderState.newLine = Number.isFinite(newStart) ? newStart : null;
+      }
+      if (/^---\s+/.test(line)) return { className: 'diff-meta', sign: '---', text: line.slice(4), lineNumber: '' };
+      if (/^\+\+\+\s+/.test(line)) return { className: 'diff-meta', sign: '+++', text: line.slice(4), lineNumber: '' };
+      if (/^@@/.test(line)) return { className: 'diff-meta', sign: '@@', text: line.replace(/^@@+\s*/, ''), lineNumber: '' };
+      return { className: 'diff-meta', sign: '', text: line, lineNumber: '' };
     }
 
     if (/^\+/.test(line) && !/^\+\+\+/.test(line)) {
-      return { className: 'diff-add', sign: '+', text: line.slice(1) };
+      const lineNumber = Number.isFinite(renderState.newLine) ? renderState.newLine : '';
+      if (Number.isFinite(renderState.newLine)) renderState.newLine += 1;
+      return { className: 'diff-add', sign: '+', text: line.slice(1), lineNumber };
     }
     if (/^-/.test(line) && !/^---/.test(line)) {
-      return { className: 'diff-del', sign: '-', text: line.slice(1) };
+      const lineNumber = Number.isFinite(renderState.oldLine) ? renderState.oldLine : '';
+      if (Number.isFinite(renderState.oldLine)) renderState.oldLine += 1;
+      return { className: 'diff-del', sign: '-', text: line.slice(1), lineNumber };
     }
     if (/^ /.test(line)) {
-      return { className: 'diff-context', sign: ' ', text: line.slice(1) };
+      const lineNumber = Number.isFinite(renderState.newLine)
+        ? renderState.newLine
+        : (Number.isFinite(renderState.oldLine) ? renderState.oldLine : '');
+      if (Number.isFinite(renderState.oldLine)) renderState.oldLine += 1;
+      if (Number.isFinite(renderState.newLine)) renderState.newLine += 1;
+      return { className: 'diff-context', sign: ' ', text: line.slice(1), lineNumber };
     }
 
-    return { className: 'diff-context', sign: ' ', text: line };
+    return { className: 'diff-context', sign: ' ', text: line, lineNumber: '' };
   }
 
   function renderDiffCodeBlock(text, parsedLang) {
     const rawText = String(text || '');
     const lines = rawText.split(/\r?\n/);
+    const lineState = { oldLine: null, newLine: null };
     const diffLinesHtml = lines.map((rawLine) => {
-      const { className, sign, text: body } = classifyDiffLineForRender(rawLine);
-      return `<span class="diff-line ${className}"><span class="diff-sign">${escapeHtml(sign)}</span><span class="diff-text">${escapeHtml(body)}</span></span>`;
+      const { className, sign, text: body, lineNumber } = classifyDiffLineForRender(rawLine, lineState);
+      const safeLineNumber = lineNumber === '' ? '' : String(lineNumber);
+      return `<span class="diff-line ${className}"><span class="diff-line-num">${escapeHtml(safeLineNumber)}</span><span class="diff-sign">${escapeHtml(sign)}</span><span class="diff-text">${escapeHtml(body)}</span></span>`;
     }).join('');
     const langLabel = parsedLang || 'diff';
+    const rawCodeAttr = encodeURIComponent(rawText);
 
     return `<div class="code-block-wrapper is-diff">
       <div class="code-block-header">
         <span class="code-lang">${escapeHtml(langLabel)}</span>
-        <button class="code-copy-btn" data-action="copy">복사</button>
+        <button class="code-copy-btn" data-action="copy" data-raw-code="${rawCodeAttr}">복사</button>
       </div>
       <pre><code class="hljs">${diffLinesHtml}</code></pre>
     </div>`;
@@ -470,10 +497,11 @@
     const highlighted = renderHighlightedCode(text, language);
     const langLabel = language || 'code';
     const langClass = language ? ` language-${language.replace(/[^a-z0-9_-]/gi, '')}` : '';
+    const rawCodeAttr = encodeURIComponent(String(text || ''));
     return `<div class="code-block-wrapper">
       <div class="code-block-header">
         <span class="code-lang">${escapeHtml(langLabel)}</span>
-        <button class="code-copy-btn" data-action="copy">복사</button>
+        <button class="code-copy-btn" data-action="copy" data-raw-code="${rawCodeAttr}">복사</button>
       </div>
       <pre><code class="hljs${langClass}">${highlighted}</code></pre>
     </div>`;
@@ -620,6 +648,7 @@
   const DEFAULT_MODEL_ID = 'GPT-5.3-Codex';
   const DEFAULT_REASONING = 'extra high';
   const RUNTIME_INFO_VERSION = 3;
+  const CODEX_RATE_LIMIT_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
   const STREAM_RENDER_THROTTLE_MS = 70;
   const STREAM_SECTIONS_PARSE_INTERVAL_MS = 280;
   const SHOW_STREAMING_WORK_PANEL = false;
@@ -1376,25 +1405,36 @@
     return args;
   }
 
+  function mergeCodexExecArgsWithGlobalFlags(baseArgs, extraArgs) {
+    const base = Array.isArray(baseArgs) ? [...baseArgs] : [];
+    const extras = Array.isArray(extraArgs) ? extraArgs.filter(Boolean) : [];
+    if (extras.length === 0) return base;
+
+    // codex global options: must be placed before subcommand(`exec`)
+    const globalFlags = [];
+    const execFlags = [];
+    for (const arg of extras) {
+      if (arg === '--search') {
+        globalFlags.push(arg);
+      } else {
+        execFlags.push(arg);
+      }
+    }
+
+    if (globalFlags.length === 0) {
+      return [...base, ...execFlags];
+    }
+
+    const first = String(base[0] || '').trim();
+    if (first.toLowerCase() === 'exec') {
+      return [...globalFlags, 'exec', ...base.slice(1), ...execFlags];
+    }
+
+    return [...globalFlags, ...base, ...execFlags];
+  }
+
   function buildCodexPrompt(promptText) {
-    const userPrompt = String(promptText || '').trim();
-    const diffPolicy = [
-      '',
-      '[응답 형식 규칙]',
-      '파일을 수정/추가/삭제했다면, 최종 답변 끝에 반드시 "변경 Diff" 섹션을 추가하세요.',
-      '해당 섹션에는 unified diff 형식 코드블록만 포함하세요.',
-      '예시 형식:',
-      '```diff',
-      'diff --git a/path/to/file b/path/to/file',
-      '--- a/path/to/file',
-      '+++ b/path/to/file',
-      '@@ -old,+new @@',
-      '-old line',
-      '+new line',
-      '```',
-      '파일 변경이 없으면 "변경 Diff" 섹션을 추가하지 마세요.',
-    ].join('\n');
-    return `${userPrompt}\n${diffPolicy}`.trim();
+    return String(promptText || '').trim();
   }
 
   function stripWrappingQuotes(text) {
@@ -2075,8 +2115,14 @@
 
     if (command === '/status') {
       showSlashFeedback('Codex 사용량 상태를 갱신 중입니다...', false);
-      await refreshCodexRateLimits('slash');
-      showSlashFeedback('5h/weekly limit 상태를 갱신했습니다.', false);
+      const refreshed = await refreshCodexRateLimits('slash');
+      if (refreshed?.skipped) {
+        showSlashFeedback('최근 10분 내 갱신되어 상태를 유지했습니다.', false);
+      } else if (refreshed?.success) {
+        showSlashFeedback('5h/weekly limit 상태를 갱신했습니다.', false);
+      } else {
+        showSlashFeedback('상태 갱신에 실패하여 기존 값을 유지합니다.', true);
+      }
       return true;
     }
 
@@ -2136,7 +2182,7 @@
         showSlashFeedback('/search 뒤에 질문을 입력하세요.', true);
         return true;
       }
-      await runCodexWithExtraArgs(['--search'], argText);
+      await runCodexWithExtraArgs(['--search'], argText, { forceNewSession: true });
       return true;
     }
 
@@ -4036,8 +4082,25 @@
     const lines = String(text || '').split(/\r?\n/);
     const out = [];
     let inFence = false;
+    let skipChangedDiffSection = false;
+    const hasMixedDiffNeighborhood = (centerIndex, radius = 3) => {
+      let plus = 0;
+      let minus = 0;
+      const start = Math.max(0, Number(centerIndex) - Number(radius));
+      const end = Math.min(lines.length - 1, Number(centerIndex) + Number(radius));
+      for (let idx = start; idx <= end; idx++) {
+        const sample = String(lines[idx] || '').trim();
+        if (!sample) continue;
+        if (/^(?:\+\+\+|---)\s/.test(sample)) continue;
+        if (/^\+/.test(sample)) plus += 1;
+        else if (/^-/.test(sample)) minus += 1;
+        if (plus > 0 && minus > 0) return true;
+      }
+      return false;
+    };
 
-    for (let raw of lines) {
+    for (let index = 0; index < lines.length; index++) {
+      const raw = lines[index];
       let line = String(raw || '');
       let t = line.trim();
       if (!t) {
@@ -4052,6 +4115,21 @@
       }
       if (inFence) continue;
 
+      if (
+        /^(?:#{1,6}\s*)?변경\s*diff(?:\s*[:\-].*)?$/i.test(t)
+        || /^\*\*변경\s*diff\*\*(?:\s*[:\-].*)?$/i.test(t)
+      ) {
+        skipChangedDiffSection = true;
+        continue;
+      }
+      if (skipChangedDiffSection) {
+        if (/^#{1,6}\s+\S/.test(t)) {
+          skipChangedDiffSection = false;
+        } else {
+          continue;
+        }
+      }
+
       // 채널 표식 제거
       const marker = parseOutputChannelMarker(t);
       if (marker) {
@@ -4064,7 +4142,15 @@
       if (!t) continue;
       if (isPromptMetaLine(t) || isSystemMetaLine(t) || isNoisyExecutionLogLine(t)) continue;
       if (isLikelyCommandOutput(t) || isLikelyFilePathLine(t)) continue;
-      if (isLikelyDiffMetaLine(t) || isLikelyDiffChangeLine(t)) continue;
+      if (isLikelyDiffMetaLine(t)) continue;
+      if (isLikelyDiffChangeLine(t)) {
+        const prevNonEmpty = findPrevNonEmptyLine(lines, index);
+        const nextNonEmpty = findNextNonEmptyLine(lines, index + 1);
+        const hasMetaContext = isLikelyDiffMetaLine(prevNonEmpty) || isLikelyDiffMetaLine(nextNonEmpty);
+        const isListLike = /^[-*+]\s+/.test(t) || /^\d+\.\s+/.test(t);
+        const hasMixedNeighborhood = hasMixedDiffNeighborhood(index, 3);
+        if (hasMetaContext || (!isListLike && hasMixedNeighborhood)) continue;
+      }
       if (/^\*{3}\s*(Begin|End|Update|Add|Delete|Move)\b/i.test(t)) continue;
       if (/^(analysis|commentary|summary|user)\s*[:\-]/i.test(t)) continue;
       if (/^CODE$/i.test(t)) continue;
@@ -6300,7 +6386,7 @@
     return chunks;
   }
 
-  function buildFileDiffBlocks(patchBlocks, maxFiles = 8) {
+  function buildFileDiffBlocks(patchBlocks) {
     const byFile = new Map();
     const chunkSeen = new Set();
 
@@ -6317,7 +6403,7 @@
         if (!hasMeaningfulDiffChange(diff)) continue;
         const fileKey = toCodeFileGroupKey(file) || file.toLowerCase();
         const displayFile = normalizeCodeFilePathForGrouping(file) || file;
-        const chunkKey = `${fileKey}|${normalizeDetailLine(diff).slice(0, 520)}`;
+        const chunkKey = `${fileKey}|${diff.length}|${normalizeDetailLine(diff).slice(0, 1024)}`;
         if (chunkSeen.has(chunkKey)) continue;
         chunkSeen.add(chunkKey);
         if (!byFile.has(fileKey)) {
@@ -6335,22 +6421,49 @@
       if (!hasMeaningfulDiffChange(merged)) continue;
       out.push({
         file: item.file,
-        diff: merged.length > 20000 ? `${merged.slice(0, 20000)}\n...` : merged,
+        diff: merged,
       });
-      if (out.length >= Math.max(1, maxFiles)) break;
     }
     return out;
   }
 
-  function buildCodexCodeTabMarkdown(sections, rawText = '') {
+  function normalizeActualCodeDiffEntries(entries) {
+    const byFile = new Map();
+    for (const item of Array.isArray(entries) ? entries : []) {
+      const rawFile = normalizeDetailLine(String(item?.file || ''));
+      const normalizedFile = normalizeCodeFilePathForGrouping(rawFile) || normalizePatchFilePath(rawFile) || rawFile;
+      const diff = String(item?.diff || '').replace(/\r\n/g, '\n').trim();
+      if (!normalizedFile || !diff) continue;
+      const key = toCodeFileGroupKey(normalizedFile) || normalizedFile.toLowerCase();
+      if (!byFile.has(key)) {
+        byFile.set(key, { file: normalizedFile, chunks: [], seen: new Set() });
+      }
+      const entry = byFile.get(key);
+      entry.file = choosePreferredCodeFilePath(entry.file, normalizedFile);
+      const diffKey = `${diff.length}|${normalizeDetailLine(diff).slice(0, 1024)}`;
+      if (entry.seen.has(diffKey)) continue;
+      entry.seen.add(diffKey);
+      entry.chunks.push(diff);
+    }
+
+    return [...byFile.values()]
+      .map(entry => ({
+        file: entry.file,
+        diff: entry.chunks.join('\n').trim(),
+      }))
+      .filter(entry => entry.file && entry.diff);
+  }
+
+  function buildCodexCodeTabMarkdown(sections, rawText = '', actualCodeDiffs = []) {
     const details = getCodeChangeDetails(sections, rawText);
+    const normalizedActualDiffs = normalizeActualCodeDiffEntries(actualCodeDiffs);
     const sourcePatchText = [
       String(sections?.response?.raw || ''),
       String(sections?.thinking?.content || ''),
       ...collectJsonTextPayloads(rawText),
     ].filter(Boolean).join('\n');
-    const patchBlocksRaw = extractPatchBlocksFromRaw(rawText, 4);
-    const patchBlocksFromSource = extractPatchBlocksFromText(sourcePatchText, 4);
+    const patchBlocksRaw = extractPatchBlocksFromRaw(rawText, 24);
+    const patchBlocksFromSource = extractPatchBlocksFromText(sourcePatchText, 24);
     const patchBlockSeen = new Set();
     const patchBlocks = [];
     for (const block of [...patchBlocksRaw, ...patchBlocksFromSource]) {
@@ -6359,10 +6472,13 @@
       if (!isMeaningfulPatchBlock(block)) continue;
       patchBlockSeen.add(key);
       patchBlocks.push(block);
-      if (patchBlocks.length >= 4) break;
     }
-    const fileDiffBlocks = buildFileDiffBlocks(patchBlocks, 8);
-    const patchFiles = summarizePatchFilesFromBlocks(patchBlocks);
+    const modelFileDiffBlocks = buildFileDiffBlocks(patchBlocks);
+    const fileDiffBlocks = normalizedActualDiffs.length > 0 ? normalizedActualDiffs : modelFileDiffBlocks;
+    const patchSummarySources = normalizedActualDiffs.length > 0
+      ? normalizedActualDiffs.map(item => item.diff)
+      : patchBlocks;
+    const patchFiles = summarizePatchFilesFromBlocks(patchSummarySources);
     if ((!details || details.length === 0) && patchFiles.length === 0) {
       return '코드 변경 내용이 감지되지 않았습니다.';
     }
@@ -6447,8 +6563,8 @@
     return lines.join('\n');
   }
 
-  function renderCodexCodeBrief(sections, rawText = '') {
-    const markdown = buildCodexCodeTabMarkdown(sections, rawText);
+  function renderCodexCodeBrief(sections, rawText = '', actualCodeDiffs = []) {
+    const markdown = buildCodexCodeTabMarkdown(sections, rawText, actualCodeDiffs);
     return `<div class="code-brief">${renderMarkdown(markdown, { skipPreprocess: true })}</div>`;
   }
 
@@ -6548,12 +6664,16 @@
 
   // opts: { activeTab, isStreaming }
   function renderCodexStructured(sections, opts) {
-    const { activeTab = 'answer', isStreaming = false, rawText = '' } = opts || {};
+    const { activeTab = 'answer', isStreaming = false, rawText = '', actualCodeDiffs = [] } = opts || {};
     const currentTab = ['answer', 'process', 'code'].includes(activeTab) ? activeTab : 'answer';
     const finalAnswer = formatAnswerLineBreaks(sanitizeFinalAnswerText(sections.response.content || ''));
     const responseHtml = renderMarkdown(finalAnswer || '최종 답변을 정리했습니다.');
     const processHtml = renderCodexProcessBrief(sections, isStreaming, rawText);
-    const codeHtml = renderCodexCodeBrief(sections, rawText);
+    const shouldRenderCodeNow = currentTab === 'code';
+    const codeHtml = shouldRenderCodeNow
+      ? renderCodexCodeBrief(sections, rawText, actualCodeDiffs)
+      : '<div class="code-brief"><p>코드 탭을 열면 diff를 불러옵니다.</p></div>';
+    const codeRenderedFlag = shouldRenderCodeNow ? '1' : '0';
 
     const answerActive = currentTab === 'answer' ? ' active' : '';
     const processActive = currentTab === 'process' ? ' active' : '';
@@ -6569,7 +6689,7 @@
     </div>
     <div class="msg-tab-content${answerHidden}" data-tab-content="answer">${responseHtml}</div>
     <div class="msg-tab-content${processHidden}" data-tab-content="process">${processHtml}</div>
-    <div class="msg-tab-content${codeHidden}" data-tab-content="code">${codeHtml}</div>`;
+    <div class="msg-tab-content${codeHidden}" data-tab-content="code" data-code-rendered="${codeRenderedFlag}">${codeHtml}</div>`;
   }
 
   function updateCodexStatusbar(sections) {
@@ -6591,7 +6711,19 @@
     renderCodexStatusbar();
   }
 
-  async function refreshCodexRateLimits(reason = 'auto') {
+  async function refreshCodexRateLimits(reason = 'auto', options = {}) {
+    const now = Date.now();
+    const force = Boolean(options?.force);
+    const lastUpdatedAt = Number(codexLimitSnapshot?.updatedAt) || 0;
+    if (!force && lastUpdatedAt > 0 && now - lastUpdatedAt < CODEX_RATE_LIMIT_REFRESH_INTERVAL_MS) {
+      renderCodexStatusbar();
+      return {
+        success: true,
+        skipped: true,
+        nextAt: lastUpdatedAt + CODEX_RATE_LIMIT_REFRESH_INTERVAL_MS,
+      };
+    }
+
     try {
       const result = await window.electronAPI.codex.rateLimits();
       if (result?.success) {
@@ -6604,15 +6736,16 @@
           weekly: normalizePercent(result.weeklyRemaining),
           h5ResetAt: h5ResetAt || (Number.isFinite(h5WindowMin) && h5WindowMin > 0 ? Date.now() + h5WindowMin * 60000 : null),
           weeklyResetAt: weeklyResetAt || (Number.isFinite(weeklyWindowMin) && weeklyWindowMin > 0 ? Date.now() + weeklyWindowMin * 60000 : null),
+          updatedAt: Date.now(),
         });
         renderCodexStatusbar();
-        return true;
+        return { success: true, skipped: false };
       }
     } catch (err) {
       console.warn('[rateLimits]', reason, err);
     }
     renderCodexStatusbar();
-    return false;
+    return { success: false, skipped: false };
   }
 
   function getProfileById(id) {
@@ -6634,6 +6767,7 @@
         return renderCodexStructured(sections, {
           rawText: msg.content,
           activeTab: opts?.activeTab,
+          actualCodeDiffs: Array.isArray(msg.actualCodeDiffs) ? msg.actualCodeDiffs : [],
         });
       }
     }
@@ -6697,6 +6831,8 @@
       content: '',
       profileId: activeProfileId,
       timestamp: Date.now(),
+      actualCodeDiffs: [],
+      actualCodeDiffsFetchedAt: 0,
     };
     conv.messages.push(aiMsg);
     const aiEl = appendMessageDOM(aiMsg);
@@ -6766,10 +6902,17 @@
       saveConversations();
     }
 
-    // CLI 실행 — 서브커맨드 인자는 그대로 전달한다.
-    const cliArgs = subcommand === '--version'
-      ? ['--version']
-      : [subcommand, ...extraArgs];
+    // /review 계열은 codex review 자체가 --json을 지원하지 않으므로
+    // exec 경유로 실행해 JSONL 출력을 강제한다.
+    const normalizedSubcommand = String(subcommand || '').trim().toLowerCase();
+    let cliArgs = [];
+    if (normalizedSubcommand === '--version') {
+      cliArgs = ['--version'];
+    } else if (normalizedSubcommand === 'review') {
+      cliArgs = [...buildCodexArgs(null), 'review', ...(Array.isArray(extraArgs) ? extraArgs : [])];
+    } else {
+      cliArgs = [subcommand, ...(Array.isArray(extraArgs) ? extraArgs : [])];
+    }
 
     try {
       const runResult = await window.electronAPI.cli.run({
@@ -6798,7 +6941,7 @@
   }
 
   // === Codex exec + 추가 인자 (예: --search) ===
-  async function runCodexWithExtraArgs(extraArgs, promptText) {
+  async function runCodexWithExtraArgs(extraArgs, promptText, options = {}) {
     if (isActiveConvStreaming() || !promptText.trim()) return;
 
     if (!activeConvId || !getActiveConversation()) {
@@ -6807,9 +6950,11 @@
 
     const convId = activeConvId;
 
-    // buildCodexArgs에 추가 인자 병합
-    const originalBuild = buildCodexArgs(getActiveConversation()?.codexSessionId);
-    const mergedArgs = [...originalBuild, ...extraArgs];
+    // /search 처럼 resume 문맥과 충돌하는 옵션은 새 세션으로 실행한다.
+    // --json은 buildCodexArgs 내부에서 항상 유지된다.
+    const forceNewSession = Boolean(options?.forceNewSession);
+    const originalBuild = buildCodexArgs(forceNewSession ? null : getActiveConversation()?.codexSessionId);
+    const mergedArgs = mergeCodexExecArgsWithGlobalFlags(originalBuild, extraArgs);
 
     const conv = getActiveConversation();
     const profile = PROFILES.find(p => p.id === activeProfileId);
@@ -6839,6 +6984,8 @@
       content: '',
       profileId: activeProfileId,
       timestamp: Date.now(),
+      actualCodeDiffs: [],
+      actualCodeDiffsFetchedAt: 0,
     };
     conv.messages.push(aiMsg);
     const aiEl = appendMessageDOM(aiMsg);
@@ -7049,6 +7196,84 @@
     }
   }
 
+  async function loadActualCodeDiffsForCurrentCwd() {
+    try {
+      const result = await window.electronAPI.repo.getFileDiffs({
+        cwd: currentCwd,
+        files: [],
+      });
+      if (!result?.success || !Array.isArray(result.data)) return [];
+      return normalizeActualCodeDiffEntries(result.data);
+    } catch {
+      return [];
+    }
+  }
+
+  function getActiveConversationMessageById(messageId) {
+    const conv = getActiveConversation();
+    if (!conv || !Array.isArray(conv.messages)) return null;
+    const targetId = String(messageId || '').trim();
+    if (!targetId) return null;
+    return conv.messages.find(msg => String(msg?.id || '') === targetId) || null;
+  }
+
+  async function refreshMessageCodeTabDiffs(aiMsg, convId, aiEl, options = {}) {
+    if (!aiMsg || aiMsg.role === 'error') return false;
+    const force = Boolean(options?.force);
+    const activeTab = ['answer', 'process', 'code'].includes(String(options?.activeTab || ''))
+      ? String(options.activeTab)
+      : 'code';
+    const fetchedAt = Number(aiMsg.actualCodeDiffsFetchedAt) || 0;
+    const shouldFetch = force || fetchedAt <= 0;
+
+    if (shouldFetch) {
+      const nextDiffs = await loadActualCodeDiffsForCurrentCwd();
+      aiMsg.actualCodeDiffs = nextDiffs;
+      aiMsg.actualCodeDiffsFetchedAt = Date.now();
+      saveConversations();
+    }
+
+    if (convId !== activeConvId) return true;
+    if (!aiEl || !aiEl.isConnected) return true;
+    const finalBody = aiEl.querySelector('.msg-body');
+    if (!finalBody) return true;
+    finalBody.innerHTML = renderAIBody(aiMsg, { activeTab });
+    if (activeTab === 'process') {
+      requestAnimationFrame(() => stickProcessStackToBottom(finalBody));
+    }
+    return true;
+  }
+
+  async function ensureCodeTabContentLoaded(body) {
+    if (!body) return;
+    const codePanel = body.querySelector('.msg-tab-content[data-tab-content="code"]');
+    if (!codePanel) return;
+    if (codePanel.dataset.codeRendered === '1') return;
+    if (body.dataset.codeLoading === '1') return;
+
+    const messageEl = body.closest('.message');
+    const messageId = String(messageEl?.dataset?.msgId || '').trim();
+    if (!messageEl || !messageId) return;
+    const msg = getActiveConversationMessageById(messageId);
+    if (!msg || msg.role === 'user' || msg.profileId !== 'codex') return;
+
+    const hasActualDiffs = Array.isArray(msg.actualCodeDiffs) && msg.actualCodeDiffs.length > 0;
+    if (hasActualDiffs) {
+      const sections = parseCodexOutput(msg.content || '');
+      codePanel.innerHTML = renderCodexCodeBrief(sections, msg.content || '', msg.actualCodeDiffs);
+      codePanel.dataset.codeRendered = '1';
+      return;
+    }
+
+    body.dataset.codeLoading = '1';
+    codePanel.innerHTML = '<div class="code-brief"><p>변경 diff를 불러오는 중...</p></div>';
+    try {
+      await refreshMessageCodeTabDiffs(msg, activeConvId, messageEl, { force: true, activeTab: 'code' });
+    } finally {
+      body.dataset.codeLoading = '0';
+    }
+  }
+
   // === 메시지 전송 ===
   async function sendMessage(promptText) {
     if (!promptText.trim()) return;
@@ -7093,6 +7318,8 @@
       content: '',
       profileId: activeProfileId,
       timestamp: Date.now(),
+      actualCodeDiffs: [],
+      actualCodeDiffsFetchedAt: 0,
     };
     conv.messages.push(aiMsg);
     const aiEl = appendMessageDOM(aiMsg);
@@ -7335,6 +7562,11 @@
     }
 
     if (text.startsWith('/')) {
+      // 실행형 슬래시 명령은 전송 후 입력창 잔존을 막기 위해 먼저 초기화한다.
+      // (/file, /help 등은 handleSlashCommand 내부에서 필요한 값을 다시 세팅)
+      $input.value = '';
+      autoResizeInput();
+      hideSlashMenu();
       const handled = await handleSlashCommand(text);
       if (handled) {
         updateSlashCommandMenu();
@@ -7598,7 +7830,20 @@
   document.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-action="copy"]');
     if (!btn) return;
-    const code = btn.closest('.code-block-wrapper').querySelector('code').textContent;
+    let code = '';
+    const rawCode = String(btn.dataset.rawCode || '');
+    if (rawCode) {
+      try {
+        code = decodeURIComponent(rawCode);
+      } catch {
+        code = '';
+      }
+    }
+    if (!code) {
+      const codeEl = btn.closest('.code-block-wrapper')?.querySelector('code');
+      code = String(codeEl?.textContent || '');
+    }
+    if (!code) return;
     navigator.clipboard.writeText(code).then(() => {
       btn.textContent = '복사됨!';
       btn.classList.add('copied');
@@ -7624,6 +7869,10 @@
     );
     if (target === 'process') {
       requestAnimationFrame(() => stickProcessStackToBottom(body));
+      return;
+    }
+    if (target === 'code') {
+      void ensureCodeTabContentLoaded(body);
     }
   });
 

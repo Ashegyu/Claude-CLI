@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, screen, dialog, shell } = require('electron
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const { spawn, execSync, spawnSync } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const pty = require('node-pty');
 
 let mainWindow = null;
@@ -107,29 +107,58 @@ function resolveOpenFileTarget(inputPath) {
   };
 }
 
-function runGitCommand(args, cwd) {
-  try {
-    const result = spawnSync('git', args, {
-      cwd,
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    return {
-      ok: result.status === 0,
-      status: Number.isFinite(result.status) ? result.status : 1,
-      stdout: String(result.stdout || ''),
-      stderr: String(result.stderr || ''),
-      error: result.error ? String(result.error.message || result.error) : '',
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      status: 1,
-      stdout: '',
-      stderr: '',
-      error: String(error?.message || error),
-    };
-  }
+function runGitCommandAsync(args, cwd) {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn('git', args, {
+        cwd,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      let settled = false;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+
+      child.stdout?.on('data', (data) => {
+        stdout += typeof data === 'string' ? data : data.toString('utf8');
+      });
+      child.stderr?.on('data', (data) => {
+        stderr += typeof data === 'string' ? data : data.toString('utf8');
+      });
+      child.on('error', (error) => {
+        finish({
+          ok: false,
+          status: 1,
+          stdout,
+          stderr,
+          error: String(error?.message || error),
+        });
+      });
+      child.on('close', (status) => {
+        finish({
+          ok: Number(status) === 0,
+          status: Number.isFinite(Number(status)) ? Number(status) : 1,
+          stdout,
+          stderr,
+          error: '',
+        });
+      });
+    } catch (error) {
+      resolve({
+        ok: false,
+        status: 1,
+        stdout: '',
+        stderr: '',
+        error: String(error?.message || error),
+      });
+    }
+  });
 }
 
 function normalizeRepoFilePath(inputPath, repoRoot, fallbackCwd) {
@@ -702,16 +731,15 @@ ipcMain.handle('file:open', async (event, { filePath }) => {
   }
 });
 
-ipcMain.handle('repo:getFileDiffs', (event, arg) => {
+ipcMain.handle('repo:getFileDiffs', async (event, arg) => {
   try {
     const requestedCwd = typeof arg?.cwd === 'string' && arg.cwd.trim()
       ? arg.cwd.trim()
       : workingDirectory;
     const files = Array.isArray(arg?.files) ? arg.files : [];
-    if (files.length === 0) return { success: true, data: [] };
 
     const cwd = fs.existsSync(requestedCwd) ? requestedCwd : workingDirectory;
-    const rootResult = runGitCommand(['rev-parse', '--show-toplevel'], cwd);
+    const rootResult = await runGitCommandAsync(['rev-parse', '--show-toplevel'], cwd);
     if (!rootResult.ok) {
       return { success: false, error: 'git repository not found', data: [] };
     }
@@ -722,34 +750,69 @@ ipcMain.handle('repo:getFileDiffs', (event, arg) => {
 
     const normalizedFiles = [];
     const seen = new Set();
-    for (const file of files) {
-      const rel = normalizeRepoFilePath(file, repoRoot, cwd);
-      if (!rel || seen.has(rel)) continue;
+    const pushRelativePath = (relPath) => {
+      const rel = String(relPath || '').trim().replace(/\\/g, '/');
+      if (!rel || seen.has(rel)) return;
       seen.add(rel);
       normalizedFiles.push(rel);
-      if (normalizedFiles.length >= 24) break;
+    };
+
+    if (files.length > 0) {
+      for (const file of files) {
+        const rel = normalizeRepoFilePath(file, repoRoot, cwd);
+        if (!rel) continue;
+        pushRelativePath(rel);
+      }
+    } else {
+      const changedCommands = [
+        ['diff', '--no-color', '--name-only', '--cached'],
+        ['diff', '--no-color', '--name-only'],
+        ['ls-files', '--others', '--exclude-standard'],
+      ];
+      for (const command of changedCommands) {
+        const result = await runGitCommandAsync(command, repoRoot);
+        if (!result.ok || !result.stdout) continue;
+        for (const line of result.stdout.split(/\r?\n/)) {
+          const rel = String(line || '').trim();
+          if (!rel) continue;
+          pushRelativePath(rel);
+        }
+      }
     }
 
     const data = [];
     for (const rel of normalizedFiles) {
-      const staged = runGitCommand(['diff', '--no-color', '--cached', '--', rel], repoRoot);
-      const unstaged = runGitCommand(['diff', '--no-color', '--', rel], repoRoot);
+      const [staged, unstaged] = await Promise.all([
+        runGitCommandAsync(['diff', '--no-color', '--cached', '--', rel], repoRoot),
+        runGitCommandAsync(['diff', '--no-color', '--', rel], repoRoot),
+      ]);
       let diffText = '';
       if (staged.ok && staged.stdout.trim()) diffText += `${staged.stdout.trim()}\n`;
       if (unstaged.ok && unstaged.stdout.trim()) diffText += `${unstaged.stdout.trim()}\n`;
 
       if (!diffText.trim()) {
-        const untracked = runGitCommand(['ls-files', '--others', '--exclude-standard', '--', rel], repoRoot);
+        const untracked = await runGitCommandAsync(['ls-files', '--others', '--exclude-standard', '--', rel], repoRoot);
         const isUntracked = untracked.ok && untracked.stdout
           .split(/\r?\n/)
           .map(line => line.trim().replace(/\\/g, '/'))
           .some(line => line === rel);
         if (isUntracked) {
           const abs = path.join(repoRoot, rel);
-          if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
-            const content = fs.readFileSync(abs, 'utf8');
-            const limited = content.length > 10000 ? `${content.slice(0, 10000)}\n...` : content;
-            const bodyLines = limited.split(/\r?\n/);
+          let stat = null;
+          try {
+            stat = await fs.promises.stat(abs);
+          } catch {
+            stat = null;
+          }
+          if (stat?.isFile()) {
+            let content = '';
+            try {
+              content = await fs.promises.readFile(abs, 'utf8');
+            } catch {
+              content = '';
+            }
+            if (!content) continue;
+            const bodyLines = content.split(/\r?\n/);
             const plusLines = bodyLines.map(line => `+${line}`).join('\n');
             diffText = [
               `diff --git a/${rel} b/${rel}`,
@@ -765,9 +828,7 @@ ipcMain.handle('repo:getFileDiffs', (event, arg) => {
 
       const trimmed = diffText.trim();
       if (!trimmed) continue;
-      const safeDiff = trimmed.length > 160000 ? `${trimmed.slice(0, 160000)}\n...` : trimmed;
-      data.push({ file: rel, diff: safeDiff });
-      if (data.length >= 12) break;
+      data.push({ file: rel, diff: trimmed });
     }
 
     return { success: true, data };
@@ -794,9 +855,58 @@ ipcMain.handle('help:openManual', () => {
 });
 
 // --- Codex rate_limits 읽기 (세션 JSONL에서) ---
+function normalizeRateLimitMeta(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function classifyRateLimitScope(rateLimits) {
+  const limitId = normalizeRateLimitMeta(rateLimits?.limit_id);
+  const limitName = normalizeRateLimitMeta(rateLimits?.limit_name);
+  const meta = `${limitId} ${limitName}`.trim();
+
+  if (
+    limitId === 'codex'
+    || limitId === 'context_window'
+    || limitName === 'context window'
+    || meta.includes('context window')
+  ) {
+    return 'context-window';
+  }
+  if (meta.includes('spark') || limitId.includes('bengalfox')) {
+    return 'spark';
+  }
+  return 'unknown';
+}
+
+function toRateLimitSnapshot(rateLimits) {
+  if (!rateLimits || !rateLimits.primary || !rateLimits.secondary) return null;
+  const h5Used = Number(rateLimits.primary.used_percent);
+  const weeklyUsed = Number(rateLimits.secondary.used_percent);
+  if (!Number.isFinite(h5Used) || !Number.isFinite(weeklyUsed)) return null;
+
+  return {
+    success: true,
+    h5Used,
+    weeklyUsed,
+    h5Remaining: Math.max(0, 100 - h5Used),
+    weeklyRemaining: Math.max(0, 100 - weeklyUsed),
+    h5Window: rateLimits.primary.window_minutes,
+    weeklyWindow: rateLimits.secondary.window_minutes,
+    h5ResetsAt: rateLimits.primary.resets_at,
+    weeklyResetsAt: rateLimits.secondary.resets_at,
+    limitId: rateLimits.limit_id || null,
+    limitName: rateLimits.limit_name || null,
+  };
+}
+
 function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
   const size = Number(fileSize);
   if (!Number.isFinite(size) || size <= 0) return null;
+
+  // 최신 로그 기준 fallback 후보를 유지하되,
+  // Context Window(codex) 항목을 찾으면 즉시 우선 반환한다.
+  let fallbackNonSpark = null;
+  let fallbackAny = null;
 
   // 파일 전체를 읽으면 UI가 멈출 수 있으므로, tail만 단계적으로 읽어 마지막 rate_limits를 찾는다.
   const chunkSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024]; // 256KB -> 1MB -> 4MB
@@ -827,30 +937,24 @@ function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
           || obj?.payload?.info?.rate_limits
           || obj?.rate_limits
           || null;
-        if (!rl || !rl.primary || !rl.secondary) continue;
+        const snapshot = toRateLimitSnapshot(rl);
+        if (!snapshot) continue;
 
-        const h5Used = Number(rl.primary.used_percent);
-        const weeklyUsed = Number(rl.secondary.used_percent);
-        if (!Number.isFinite(h5Used) || !Number.isFinite(weeklyUsed)) continue;
-
-        return {
-          success: true,
-          h5Used,
-          weeklyUsed,
-          h5Remaining: Math.max(0, 100 - h5Used),
-          weeklyRemaining: Math.max(0, 100 - weeklyUsed),
-          h5Window: rl.primary.window_minutes,
-          weeklyWindow: rl.secondary.window_minutes,
-          h5ResetsAt: rl.primary.resets_at,
-          weeklyResetsAt: rl.secondary.resets_at,
-        };
+        if (!fallbackAny) fallbackAny = snapshot;
+        const scope = classifyRateLimitScope(rl);
+        if (scope !== 'spark' && !fallbackNonSpark) {
+          fallbackNonSpark = snapshot;
+        }
+        if (scope === 'context-window') {
+          return snapshot;
+        }
       } catch {
         // malformed json line
       }
     }
   }
 
-  return null;
+  return fallbackNonSpark || fallbackAny || null;
 }
 
 ipcMain.handle('codex:rateLimits', () => {

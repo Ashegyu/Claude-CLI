@@ -53,7 +53,8 @@
       "Bash(cd \"C:/Users/GC/Desktop/업무/JGKim/Claude CLI\" && npx electron-builder --win --config.directories.output=dist-temp20 2>&1)",
       "Bash(cd \"C:/Users/GC/Desktop/업무/JGKim/Claude CLI\" && npx electron-builder --win --config.directories.output=dist-temp21 2>&1)",
       "Bash(cd \"C:/Users/GC/Desktop/업무/JGKim/Claude CLI\" && npx electron-builder --win --config.directories.output=dist-temp22 2>&1)",
-      "Bash(cd C:\\\\Users\\\\GC\\\\Desktop\\\\업무\\\\JGKim\\\\Claude CLI:*)"
+      "Bash(cd C:\\\\Users\\\\GC\\\\Desktop\\\\업무\\\\JGKim\\\\Claude CLI:*)",
+      "Bash(npm start:*)"
     ]
   }
 }
