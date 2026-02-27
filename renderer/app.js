@@ -128,6 +128,8 @@
     const v = String(href || '').trim();
     if (!v) return false;
     if (/^\/?[A-Za-z]:[\\/]/.test(v)) return true; // C:/...
+    if (/^\\\\[^\\\/]+[\\\/][^\\\/]+/.test(v)) return true; // \\server\share\...
+    if (/^\/\/[^/]+\/[^/]+/.test(v)) return true; // //server/share/...
     if (/^file:\/\/\/?/i.test(v)) return true;
     if (/^\.\.?[\\/]/.test(v)) return true;
     if (/^\/(?:Users|home|tmp|var|opt|etc)\//.test(v)) return true;
@@ -139,6 +141,7 @@
     let value = String(href).trim();
     if (!value) return '';
     if (!isLikelyLocalFileLinkTarget(value)) return value;
+    const isUncLike = /^\\\\/.test(value) || /^\/\/[^/]+\/[^/]+/.test(value);
 
     // angle-bracket autolink 표기 보정
     if (value.startsWith('<') && value.endsWith('>')) {
@@ -162,16 +165,32 @@
     // Windows 절대경로를 앱에서 일관되게 /C:/... 형태로 유지
     if (/^[A-Za-z]:\//.test(value)) {
       value = `/${value}`;
+    } else if (isUncLike) {
+      // UNC 경로는 //server/share/... 형태로 표준화
+      value = `//${value.replace(/^\/+/, '')}`;
     }
-
-    // 경로 내 공백은 URL-safe 형태로 인코딩
-    value = value.replace(/ /g, '%20');
 
     if (hashPart) {
       const normalizedHash = hashPart.replace(/\s+/g, '');
       return `${value}${normalizedHash}`;
     }
     return value;
+  }
+
+  function safeDecodeURIComponentOnce(value) {
+    const raw = String(value || '');
+    if (!raw) return '';
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  function encodeLocalPathForDataAttr(rawPath) {
+    const normalizedPath = normalizeLocalFileLinkTarget(rawPath) || String(rawPath || '');
+    const decodedPath = safeDecodeURIComponentOnce(normalizedPath);
+    return encodeURIComponent(decodedPath);
   }
 
   function mergeWrappedTokenBoundary(leftPart, rightPart) {
@@ -235,6 +254,8 @@
   function mergeWrappedMarkdownLinks(text) {
     const lines = String(text || '').split(/\r?\n/);
     const out = [];
+    const MAX_LINK_WRAP_MERGE_LINES = 4;
+    const MAX_LINK_WRAP_MERGE_LENGTH = 1800;
 
     const hasUnclosedLinkTarget = (line) => {
       const s = String(line || '');
@@ -244,6 +265,31 @@
       return close < 0;
     };
 
+    const isLinkMergeStopLine = (trimmedLine) => {
+      const t = String(trimmedLine || '');
+      if (!t) return true;
+      if (/^\|/.test(t)) return true;
+      if (/^```/.test(t)) return true;
+      if (/^[-*+]\s+/.test(t)) return true;
+      if (/^\d+\.\s+/.test(t)) return true;
+      return false;
+    };
+
+    const isLikelyLinkTargetContinuation = (trimmedLine) => {
+      const t = String(trimmedLine || '');
+      if (!t) return false;
+      if (t.length > 400) return false;
+      const hasPathHint = (
+        /[\\/]/.test(t)
+        || /^[A-Za-z]:/.test(t)
+        || /^[#?&=)/]/.test(t)
+        || /%[0-9A-Fa-f]{2}/.test(t)
+        || /\.[A-Za-z0-9]{1,8}\)?$/.test(t)
+      );
+      if (!hasPathHint) return false;
+      return /^[A-Za-z0-9_.$%/+\\:\-#?=&()~,\[\];@가-힣 ]+$/.test(t);
+    };
+
     for (let i = 0; i < lines.length; i++) {
       let current = String(lines[i] || '');
       if (!hasUnclosedLinkTarget(current)) {
@@ -251,20 +297,32 @@
         continue;
       }
 
+      const original = current;
       let consumedUntil = i;
+      let mergedLines = 0;
       for (let j = i + 1; j < lines.length; j++) {
         const nextRaw = String(lines[j] || '');
         const nextTrimmed = nextRaw.trim();
-        if (!nextTrimmed) break;
-        if (/^\|/.test(nextTrimmed) || /^```/.test(nextTrimmed) || /^[-*+]\s+/.test(nextTrimmed)) break;
+        if (isLinkMergeStopLine(nextTrimmed)) break;
+        if (!isLikelyLinkTargetContinuation(nextTrimmed)) break;
 
-        current = mergeWrappedTokenBoundary(current, nextTrimmed);
+        const merged = mergeWrappedTokenBoundary(current, nextTrimmed);
+        if (merged.length > MAX_LINK_WRAP_MERGE_LENGTH) break;
+        current = merged;
         consumedUntil = j;
+        mergedLines += 1;
         if (!hasUnclosedLinkTarget(current)) break;
+        if (mergedLines >= MAX_LINK_WRAP_MERGE_LINES) break;
       }
 
-      out.push(current);
-      i = consumedUntil;
+      // 닫힘이 확정된 경우에만 병합 결과를 채택한다.
+      if (!hasUnclosedLinkTarget(current) && consumedUntil > i) {
+        out.push(current);
+        i = consumedUntil;
+        continue;
+      }
+
+      out.push(original);
     }
 
     return out.join('\n');
@@ -360,7 +418,7 @@
     if (isLikelyLocalFileLinkTarget(href)) {
       const normalizedHref = normalizeLocalFileLinkTarget(href) || href;
       const parsed = parseLocalLinkPathAndLine(normalizedHref, text);
-      const encodedPath = encodeURIComponent(parsed.path || normalizedHref);
+      const encodedPath = encodeLocalPathForDataAttr(parsed.path || normalizedHref);
       const lineAttr = Number.isFinite(parsed.line) && parsed.line > 0
         ? ` data-line="${parsed.line}"`
         : '';
@@ -369,7 +427,8 @@
     }
     const safeHref = escapeHtml(href);
     const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
-    return `<a href="${safeHref}"${safeTitle} target="_blank" rel="noopener">${text || safeHref}</a>`;
+    const safeText = escapeHtml(text || href);
+    return `<a href="${safeHref}"${safeTitle} target="_blank" rel="noopener">${safeText}</a>`;
   };
 
   marked.setOptions({
@@ -3176,8 +3235,7 @@
   function toSearchHitFileLinkCell(filePath, lineNum) {
     const rawPath = String(filePath || '').trim();
     if (!rawPath) return '';
-    const normalizedPath = normalizeLocalFileLinkTarget(rawPath) || rawPath;
-    const encodedPath = encodeURIComponent(normalizedPath);
+    const encodedPath = encodeLocalPathForDataAttr(rawPath);
     const parsedLine = Number(lineNum);
     const safeLine = Number.isFinite(parsedLine) && parsedLine > 0 ? String(parsedLine) : '';
     const lineAttr = safeLine ? ` data-line="${safeLine}"` : '';
@@ -3189,8 +3247,7 @@
     const parsedLine = Number(lineNum);
     const safeLine = Number.isFinite(parsedLine) && parsedLine > 0 ? String(parsedLine) : '';
     if (!rawPath || !safeLine) return escapeHtml(String(lineNum ?? ''));
-    const normalizedPath = normalizeLocalFileLinkTarget(rawPath) || rawPath;
-    const encodedPath = encodeURIComponent(normalizedPath);
+    const encodedPath = encodeLocalPathForDataAttr(rawPath);
     return `<a href="#" class="search-hit-line-link" data-local-path="${encodedPath}" data-line="${safeLine}">${safeLine}</a>`;
   }
 
@@ -6060,6 +6117,8 @@
       if (!input) return '';
       if (
         /^\/?[A-Za-z]:[\\/]/.test(input)
+        || /^\\\\[^\\\/]+[\\\/][^\\\/]+/.test(input)
+        || /^\/\/[^/]+\/[^/]+/.test(input)
         || /^file:\/\/\/?/i.test(input)
         || /^\/(?:Users|home|tmp|var|opt|etc)\//.test(input)
       ) {
