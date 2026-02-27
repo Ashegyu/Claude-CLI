@@ -1,0 +1,8 @@
+version: 1.0.0
+files:
+  - url: CLI-Chat-Setup-1.0.0.exe
+    sha512: 2MaiPLJbpIpq1GP7P1E0qRgm1XiOSHBkm6ZLeELO3dypKnKvEP2D5MoHKkZ0etDa1O71C4NIWr9isv309zYDMA==
+    size: 86461349
+path: CLI-Chat-Setup-1.0.0.exe
+sha512: 2MaiPLJbpIpq1GP7P1E0qRgm1XiOSHBkm6ZLeELO3dypKnKvEP2D5MoHKkZ0etDa1O71C4NIWr9isv309zYDMA==
+releaseDate: '2026-02-27T02:42:31.973Z'
