@@ -7342,7 +7342,13 @@
     const match = /^\[([^\]]*)\]\(([^)]*)\)$/.exec(md);
     if (match) {
       const display = match[1].replace(/\\([[\]*_`\\])/g, '$1');
-      return `<a href="${escapeHtml(match[2])}" title="${escapeHtml(display)}">${escapeHtml(display)}</a>`;
+      const href = match[2];
+      const parsed = parseLocalLinkPathAndLine(href, display);
+      const encodedPath = encodeLocalPathForDataAttr(parsed.path || href);
+      const lineAttr = Number.isFinite(parsed.line) && parsed.line > 0
+        ? ` data-line="${parsed.line}"`
+        : '';
+      return `<a href="#" class="file-path-link" data-local-path="${encodedPath}"${lineAttr} title="${escapeHtml(display)}">${escapeHtml(display)}</a>`;
     }
     return `<span>${escapeHtml(md.replace(/^`|`$/g, ''))}</span>`;
   }
