@@ -30,6 +30,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   file: {
     pickAndRead: () => ipcRenderer.invoke('file:pickAndRead'),
     read: (filePath) => ipcRenderer.invoke('file:read', { filePath }),
+    readMultiple: (filePaths) => ipcRenderer.invoke('file:readMultiple', { filePaths }),
     open: (filePath) => ipcRenderer.invoke('file:open', { filePath }),
   },
   repo: {

@@ -224,6 +224,139 @@
     return `${left}${adjustedRight}`;
   }
 
+  // === 승인 요청 감지 및 처리 ===
+
+  /**
+   * JSONL 스트림 chunk에서 승인 요청 이벤트를 감지한다.
+   * Codex CLI가 --approval-policy 모드에서 출력하는 다양한 승인 요청 형식을 지원한다.
+   * @param {string} chunk - 스트림 chunk 텍스트
+   * @returns {object|null} 승인 요청 정보 또는 null
+   */
+  function detectApprovalRequest(chunk) {
+    const text = String(chunk || '');
+    if (!text) return null;
+
+    const lines = text.split(/\r?\n/);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('{')) continue;
+      let obj = null;
+      try { obj = JSON.parse(trimmed); } catch { continue; }
+      if (!obj || typeof obj !== 'object') continue;
+
+      const type = String(obj.type || '').toLowerCase();
+      const item = obj.item || obj.payload?.item || obj.payload || {};
+      const itemType = String(item.type || '').toLowerCase();
+      const status = String(item.status || item.approval_status || '').toLowerCase();
+
+      // 패턴 1: 전용 approval_request 이벤트
+      if (type === 'approval_request' || type === 'item.approval_request') {
+        return buildApprovalInfo(obj, item);
+      }
+
+      // 패턴 2: event_msg 내 approval 관련 이벤트
+      if (type === 'event_msg') {
+        const eventType = String((obj.payload || {}).type || '').toLowerCase();
+        if (eventType === 'approval_request' || eventType === 'request_approval') {
+          return buildApprovalInfo(obj, obj.payload || {});
+        }
+      }
+
+      // 패턴 3: item.started/item.updated에서 command_execution이 needs_approval 상태
+      if ((type === 'item.started' || type === 'item.updated' || type === 'item.delta') &&
+          (itemType === 'command_execution' || itemType === 'tool_call') &&
+          (status === 'needs_approval' || status === 'pending_approval' || status === 'approval_required')) {
+        return buildApprovalInfo(obj, item);
+      }
+
+      // 패턴 4: approval_required 플래그가 true인 모든 이벤트
+      if (item.approval_required === true || obj.approval_required === true) {
+        return buildApprovalInfo(obj, item);
+      }
+    }
+
+    // 패턴 5: 텍스트 기반 승인 프롬프트 감지 (stderr 출력 등)
+    // Codex CLI가 비-JSON 프롬프트를 출력하는 경우
+    const textPatterns = [
+      /(?:approve|allow|permit)\s+(?:command|execution|action)\s*[:?]\s*(.+)/i,
+      /(?:do you want to|would you like to)\s+(?:run|execute|allow)\s*[:?]?\s*(.+)/i,
+      /\[(?:y(?:es)?|n(?:o)?|a(?:lways)?)\]\s*$/i,
+    ];
+    for (const pattern of textPatterns) {
+      const match = text.match(pattern);
+      if (match) {
+        return {
+          id: `approval_${Date.now()}`,
+          command: match[1] ? match[1].trim() : '(명령어 확인 필요)',
+          reason: '',
+          cwd: '',
+          rawEvent: null,
+          isTextBased: true,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function buildApprovalInfo(event, item) {
+    const command = item.command || item.cmd || event.command || event.cmd || '';
+    const commandStr = Array.isArray(command) ? command.join(' ') : String(command || '');
+    return {
+      id: String(item.id || item.call_id || item.callId || event.id || `approval_${Date.now()}`),
+      command: commandStr || '(명령어)',
+      reason: String(item.reason || event.reason || ''),
+      cwd: String(item.cwd || event.cwd || ''),
+      rawEvent: event,
+      isTextBased: false,
+    };
+  }
+
+  /**
+   * 승인 응답을 CLI 프로세스의 stdin으로 전송한다.
+   * JSON 모드와 텍스트 모드 모두 지원한다.
+   */
+  function sendApprovalResponse(streamId, decision, forSession = false, isTextBased = false) {
+    if (!streamId) return;
+    if (isTextBased) {
+      // 텍스트 기반 프롬프트에 대한 응답
+      const textResponse = decision === 'accept'
+        ? (forSession ? 'a' : 'y')
+        : 'n';
+      window.electronAPI.cli.write(streamId, textResponse + '\r');
+    } else {
+      // JSON 기반 승인 응답
+      const response = { decision };
+      if (decision === 'accept' && forSession) {
+        response.acceptSettings = { forSession: true };
+      }
+      window.electronAPI.cli.write(streamId, JSON.stringify(response) + '\n');
+    }
+  }
+
+  /**
+   * 승인 요청 버튼 HTML을 생성한다.
+   */
+  function renderApprovalButtons(approvalInfo, streamId) {
+    const commandDisplay = escapeHtml(approvalInfo.command || '(알 수 없는 명령어)');
+    const reasonDisplay = approvalInfo.reason ? `<div class="approval-reason">${escapeHtml(approvalInfo.reason)}</div>` : '';
+    const cwdDisplay = approvalInfo.cwd ? `<div class="approval-cwd">작업 폴더: ${escapeHtml(approvalInfo.cwd)}</div>` : '';
+    return `<div class="approval-request" data-approval-id="${escapeHtml(approvalInfo.id)}" data-stream-id="${escapeHtml(streamId)}" data-text-based="${approvalInfo.isTextBased ? '1' : '0'}">
+      <div class="approval-header">
+        <svg class="approval-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v2m0 4h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg>
+        <span class="approval-title">명령어 실행 승인 필요</span>
+      </div>
+      <div class="approval-command"><code>${commandDisplay}</code></div>
+      ${reasonDisplay}
+      ${cwdDisplay}
+      <div class="approval-actions">
+        <button class="approval-btn approval-btn-accept" data-decision="accept" title="이 명령어 실행을 허용합니다">허용</button>
+        <button class="approval-btn approval-btn-session" data-decision="accept-session" title="이 세션에서 유사한 명령어를 자동 허용합니다">세션 허용</button>
+        <button class="approval-btn approval-btn-deny" data-decision="deny" title="이 명령어 실행을 거부합니다">거부</button>
+      </div>
+    </div>`;
+  }
+
   // 스트리밍 chunk 경계에서 중복된 접두/접미를 제거해 문장/코드 분리 오동작을 줄인다.
   function appendStreamingChunk(accumulatedText, incomingChunk) {
     const base = String(accumulatedText || '');
@@ -591,7 +724,10 @@
   const $modelHint = document.getElementById('current-model-name');
   const $planModeHint = document.getElementById('current-plan-mode');
   const $sandboxHint = document.getElementById('current-sandbox-mode');
+  const $approvalHint = document.getElementById('current-approval-policy');
   const $contextHint = document.getElementById('context-compress-hint');
+  const $btnAttach = document.getElementById('btn-attach');
+  const $attachmentPreview = document.getElementById('attachment-preview');
   const $runtimeMenu = document.getElementById('runtime-selector-menu');
   const $slashMenu = document.getElementById('slash-command-menu');
   const $sessionPicker = document.getElementById('session-picker');
@@ -662,6 +798,18 @@
   let codexLimitSnapshot = loadCodexLimitSnapshot();
   let codexRuntimeInfo = loadCodexRuntimeInfo();
   let sandboxMode = localStorage.getItem('codexSandboxMode') || 'workspace-write';
+  let approvalPolicy = localStorage.getItem('codexApprovalPolicy') || 'auto-approve';
+
+  // === 파일 첨부 상태 ===
+  let pendingAttachments = []; // { fileType, fileName, path, content, base64, dataUrl, mimeType, size }
+
+  const APPROVAL_POLICY_OPTIONS = ['auto-approve', 'on-failure-or-unsafe', 'unless-allow-listed', 'always-prompt'];
+  const APPROVAL_POLICY_LABELS = {
+    'auto-approve': '자동 승인 (기본)',
+    'on-failure-or-unsafe': '실패/위험시 확인',
+    'unless-allow-listed': '허용 목록 외 확인',
+    'always-prompt': '항상 확인',
+  };
 
   // === 컨텍스트 압축 설정 ===
   const CONTEXT_COMPRESSION_KEY = 'contextCompressionEnabled';
@@ -1456,6 +1604,10 @@
       options = SANDBOX_OPTIONS;
       currentValue = sandboxMode;
       labelFn = opt => SANDBOX_LABELS[opt] || opt;
+    } else if (type === 'approval') {
+      options = APPROVAL_POLICY_OPTIONS;
+      currentValue = approvalPolicy;
+      labelFn = opt => APPROVAL_POLICY_LABELS[opt] || opt;
     } else if (type === 'context') {
       // 컨텍스트 압축 설정 메뉴
       const contextOptions = [
@@ -1500,6 +1652,12 @@
       localStorage.setItem('codexSandboxMode', sandboxMode);
       updateRuntimeHint();
       showSlashFeedback(`샌드박스 모드: ${SANDBOX_LABELS[value] || value}`, false);
+    }
+    if (type === 'approval' && APPROVAL_POLICY_OPTIONS.includes(value)) {
+      approvalPolicy = value;
+      localStorage.setItem('codexApprovalPolicy', approvalPolicy);
+      updateRuntimeHint();
+      showSlashFeedback(`승인 정책: ${APPROVAL_POLICY_LABELS[value] || value}`, false);
     }
     if (type === 'context') {
       if (value === 'compress-toggle') {
@@ -1546,6 +1704,9 @@
     }
     if ($sandboxHint) {
       $sandboxHint.textContent = `샌드박스: ${SANDBOX_LABELS[sandboxMode] || sandboxMode}`;
+    }
+    if ($approvalHint) {
+      $approvalHint.textContent = `승인: ${APPROVAL_POLICY_LABELS[approvalPolicy] || approvalPolicy}`;
     }
     updateContextHint();
   }
@@ -1650,10 +1811,26 @@
     // sandbox 모드에 따라 실행 방식 결정
     if (sandboxMode === 'danger-full-access') {
       args.push('--dangerously-bypass-approvals-and-sandbox');
-    } else if (sandboxMode === 'read-only') {
-      args.push('--full-auto', '--sandbox', 'read-only');
+    } else if (approvalPolicy === 'auto-approve') {
+      // 자동 승인: --full-auto
+      if (sandboxMode === 'read-only') {
+        args.push('--full-auto', '--sandbox', 'read-only');
+      } else {
+        args.push('--full-auto');
+      }
     } else {
-      args.push('--full-auto');
+      // 수동 승인: --full-auto 없이 승인 정책 전달
+      if (approvalPolicy === 'on-failure-or-unsafe') {
+        args.push('--approval-policy', 'on-failure-or-unsafe');
+      } else if (approvalPolicy === 'unless-allow-listed') {
+        args.push('--approval-policy', 'unless-allow-listed');
+      } else {
+        // always-prompt
+        args.push('--approval-policy', 'unless-allow-listed');
+      }
+      if (sandboxMode === 'read-only') {
+        args.push('--sandbox', 'read-only');
+      }
     }
     args.push('--json');
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
@@ -1702,6 +1879,11 @@
     if (conciseMode && text) {
       text = `[지시: 간결하게 답변. 코드는 핵심만, 불필요한 설명 생략]\n${text}`;
     }
+    // 첨부 파일이 있으면 프롬프트 앞에 추가
+    const attachParts = buildAttachmentPromptParts();
+    if (attachParts) {
+      text = `${attachParts}\n\n${text}`;
+    }
     return text;
   }
 
@@ -1745,10 +1927,106 @@
   }
 
   function buildImportedFilePrompt(fileData) {
+    const fileType = fileData.fileType || 'text';
+    const fileName = fileData.fileName || fileData.path;
+
+    if (fileType === 'image') {
+      // 이미지: base64 데이터를 프롬프트에 포함 (Codex CLI가 이미지 처리 가능)
+      return `[첨부 이미지]\n파일: ${fileName}\n형식: ${fileData.mimeType || 'image'}\n크기: ${formatAttachmentSize(fileData.size)}\n\n이미지가 첨부되었습니다. 위 이미지를 분석해주세요.`;
+    }
+
+    if (fileType === 'pdf') {
+      return `[첨부 PDF]\n파일: ${fileName}\n크기: ${formatAttachmentSize(fileData.size)}\n\nPDF 파일이 첨부되었습니다. 내용을 분석해주세요.`;
+    }
+
+    if (fileType === 'document' || fileType === 'archive') {
+      return `[첨부 파일]\n파일: ${fileName}\n형식: ${fileData.mimeType || fileType}\n크기: ${formatAttachmentSize(fileData.size)}\n\n${fileData.content || ''}`;
+    }
+
+    // 텍스트 파일 (기존 동작)
     const language = inferCodeFenceLanguage(fileData.path);
     const truncatedNote = fileData.truncated ? '\n주의: 파일이 커서 앞부분만 불러왔습니다.\n' : '\n';
     return `[불러온 파일]\n경로: ${fileData.path}${truncatedNote}\`\`\`${language}\n${fileData.content}\n\`\`\``;
   }
+
+  function formatAttachmentSize(bytes) {
+    if (!bytes || !Number.isFinite(bytes)) return '';
+    if (bytes < 1024) return `${bytes}B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  }
+
+  // === 첨부 파일 관리 ===
+
+  function addPendingAttachment(fileData) {
+    if (!fileData || !fileData.success) return;
+    // 중복 방지
+    if (pendingAttachments.some(a => a.path === fileData.path)) return;
+    pendingAttachments.push({
+      fileType: fileData.fileType || 'text',
+      fileName: fileData.fileName || (fileData.path ? fileData.path.split(/[\\/]/).pop() : 'file'),
+      path: fileData.path,
+      content: fileData.content || '',
+      base64: fileData.base64 || '',
+      dataUrl: fileData.dataUrl || '',
+      mimeType: fileData.mimeType || '',
+      size: fileData.size || 0,
+      truncated: !!fileData.truncated,
+    });
+    renderAttachmentPreview();
+  }
+
+  function removePendingAttachment(index) {
+    pendingAttachments.splice(index, 1);
+    renderAttachmentPreview();
+  }
+
+  function clearPendingAttachments() {
+    pendingAttachments = [];
+    renderAttachmentPreview();
+  }
+
+  function renderAttachmentPreview() {
+    if (!$attachmentPreview) return;
+    if (pendingAttachments.length === 0) {
+      $attachmentPreview.classList.add('hidden');
+      $attachmentPreview.innerHTML = '';
+      return;
+    }
+
+    $attachmentPreview.classList.remove('hidden');
+    $attachmentPreview.innerHTML = pendingAttachments.map((att, i) => {
+      let preview = '';
+      if (att.fileType === 'image' && att.dataUrl) {
+        preview = `<img src="${att.dataUrl}" alt="${escapeHtml(att.fileName)}" class="attachment-thumb" />`;
+      } else if (att.fileType === 'pdf') {
+        preview = `<div class="attachment-icon attachment-icon-pdf">PDF</div>`;
+      } else if (att.fileType === 'document') {
+        preview = `<div class="attachment-icon attachment-icon-doc">DOC</div>`;
+      } else {
+        const ext = (att.fileName || '').split('.').pop()?.toUpperCase() || 'TXT';
+        preview = `<div class="attachment-icon attachment-icon-text">${escapeHtml(ext)}</div>`;
+      }
+
+      return `<div class="attachment-item" data-index="${i}">
+        ${preview}
+        <div class="attachment-info">
+          <span class="attachment-name" title="${escapeHtml(att.path || att.fileName)}">${escapeHtml(att.fileName)}</span>
+          <span class="attachment-size">${formatAttachmentSize(att.size)}</span>
+        </div>
+        <button class="attachment-remove" data-index="${i}" title="제거">&times;</button>
+      </div>`;
+    }).join('');
+  }
+
+  function buildAttachmentPromptParts() {
+    if (pendingAttachments.length === 0) return '';
+    return pendingAttachments.map(att => buildImportedFilePrompt({
+      ...att,
+      success: true,
+    })).join('\n\n');
+  }
+
 
   function isSlashMenuOpen() {
     return !!$slashMenu && !$slashMenu.classList.contains('hidden');
@@ -2356,6 +2634,17 @@
       return;
     }
 
+    const fileType = result.fileType || 'text';
+
+    // 이미지/PDF/바이너리 파일은 첨부 큐에 추가
+    if (fileType === 'image' || fileType === 'pdf' || fileType === 'document' || fileType === 'archive') {
+      addPendingAttachment(result);
+      showSlashFeedback(`파일을 첨부했습니다: ${result.fileName || result.path} (${fileType})`, false);
+      $input.focus();
+      return;
+    }
+
+    // 텍스트 파일: 기존 동작 (입력창에 프롬프트 생성)
     $input.value = buildImportedFilePrompt(result);
     autoResizeInput();
     hideSlashMenu();
@@ -2884,6 +3173,14 @@
     });
   }
 
+  if ($approvalHint) {
+    $approvalHint.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      renderRuntimeMenu('approval');
+    });
+  }
+
   if ($contextHint) {
     $contextHint.addEventListener('click', (e) => {
       e.preventDefault();
@@ -3241,9 +3538,25 @@
     const name = msg.role === 'user' ? 'You' : profile.name;
     const time = new Date(msg.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
 
-    const bodyContent = msg.role === 'user'
-      ? escapeHtml(msg.content)
-      : renderAIBody(msg, { activeTab: msg.activeTab });
+    let bodyContent;
+    if (msg.role === 'user') {
+      let attachHtml = '';
+      if (msg.attachments && msg.attachments.length) {
+        attachHtml = '<div class="msg-attachments">';
+        for (const att of msg.attachments) {
+          if (att.fileType === 'image' && att.dataUrl) {
+            attachHtml += `<div class="msg-attach-item msg-attach-image"><img src="${att.dataUrl}" alt="${escapeHtml(att.fileName)}" /><span class="msg-attach-name">${escapeHtml(att.fileName)}</span></div>`;
+          } else {
+            const icon = att.fileType === 'pdf' ? '📄' : att.fileType === 'document' ? '📃' : att.fileType === 'archive' ? '📦' : '📝';
+            attachHtml += `<div class="msg-attach-item msg-attach-file"><span class="msg-attach-icon">${icon}</span><span class="msg-attach-name">${escapeHtml(att.fileName)}</span></div>`;
+          }
+        }
+        attachHtml += '</div>';
+      }
+      bodyContent = attachHtml + escapeHtml(msg.content);
+    } else {
+      bodyContent = renderAIBody(msg, { activeTab: msg.activeTab });
+    }
 
     el.innerHTML = `
       <div class="msg-header">
@@ -4700,6 +5013,15 @@
       if (type === 'error') {
         const msg = String(obj?.message || obj?.error?.message || '').trim();
         if (msg) appendUniqueLine(processLines, `error: ${msg}`);
+        continue;
+      }
+
+      // 승인 요청 이벤트 → 과정 섹션에 기록
+      if (type === 'approval_request' || type === 'item.approval_request') {
+        const item = obj.item || obj.payload || {};
+        const cmd = Array.isArray(item.command) ? item.command.join(' ') : String(item.command || item.cmd || '');
+        const reason = String(item.reason || '').trim();
+        appendUniqueLine(processLines, `⚠️ 승인 요청: ${cmd || '(명령어)'}${reason ? ' — ' + reason : ''}`);
         continue;
       }
 
@@ -7458,6 +7780,10 @@
       runPrompt = buildCodexPrompt(promptText);
     }
 
+    // 첨부 파일 메타정보 저장 후 큐 비우기
+    const sentAttachments = pendingAttachments.slice();
+    clearPendingAttachments();
+
     const originalBuild = buildCodexArgs(sessionIdForExtraRun);
     const mergedArgs = mergeCodexExecArgsWithGlobalFlags(originalBuild, extraArgs);
 
@@ -7473,6 +7799,7 @@
       content: promptText,
       profileId: activeProfileId,
       timestamp: Date.now(),
+      attachments: sentAttachments.length ? sentAttachments : undefined,
     };
     conv.messages.push(userMsg);
     $welcome.style.display = 'none';
@@ -7582,6 +7909,20 @@
       aiMsg.content = fullOutput;
       applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
+
+      // 승인 요청 감지 (runCodexWithExtraArgs)
+      if (approvalPolicy !== 'auto-approve') {
+        const approval = detectApprovalRequest(chunk);
+        if (approval && convId === activeConvId) {
+          streamState.pendingApproval = approval;
+          const liveBody = resolveBodyEl();
+          const existing = liveBody.querySelector('.approval-request');
+          if (existing) existing.remove();
+          liveBody.insertAdjacentHTML('beforeend', renderApprovalButtons(approval, streamId));
+          scrollToBottom();
+          return;
+        }
+      }
 
       // 스트리밍 중 세션 ID 조기 캡처
       if (!conv.codexSessionId) {
@@ -7844,6 +8185,10 @@
       runPrompt = buildCodexPrompt(promptText);
     }
 
+    // 첨부 파일 메타정보 저장 후 큐 비우기
+    const sentAttachments = pendingAttachments.slice();
+    clearPendingAttachments();
+
     // 첫 메시지 → 제목 설정 + 작업 폴더 저장
     if (conv.messages.length === 0) {
       conv.title = promptText.slice(0, 50) + (promptText.length > 50 ? '...' : '');
@@ -7858,6 +8203,7 @@
       content: promptText,
       profileId: activeProfileId,
       timestamp: Date.now(),
+      attachments: sentAttachments.length ? sentAttachments : undefined,
     };
     conv.messages.push(userMsg);
 
@@ -7973,6 +8319,20 @@
       aiMsg.content = fullOutput;
       applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
+
+      // 승인 요청 감지 (sendMessage)
+      if (approvalPolicy !== 'auto-approve') {
+        const approval = detectApprovalRequest(chunk);
+        if (approval && convId === activeConvId) {
+          streamState.pendingApproval = approval;
+          const liveBody = resolveBodyEl();
+          const existing = liveBody.querySelector('.approval-request');
+          if (existing) existing.remove();
+          liveBody.insertAdjacentHTML('beforeend', renderApprovalButtons(approval, streamId));
+          scrollToBottom();
+          return;
+        }
+      }
 
       // 스트리밍 중 세션 ID 조기 캡처
       if (!conv.codexSessionId) {
@@ -8135,7 +8495,8 @@
 
   async function submitInputText() {
     const text = $input.value.trim();
-    if (!text) return;
+    // 텍스트도 없고 첨부 파일도 없으면 무시
+    if (!text && pendingAttachments.length === 0) return;
 
     if (isStreaming && currentStreamId) {
       $input.value = '';
@@ -8169,13 +8530,76 @@
     $input.value = '';
     autoResizeInput();
     hideSlashMenu();
-    sendMessage(text);
+    // 첨부 파일만 있고 텍스트가 없으면 기본 프롬프트 사용
+    const msgText = text || '첨부된 파일을 분석해주세요.';
+    sendMessage(msgText);
   }
 
   // 전송 / 프로세스 입력
   $btnSend.addEventListener('click', () => {
     void submitInputText();
   });
+
+  // 파일 첨부 버튼
+  if ($btnAttach) {
+    $btnAttach.addEventListener('click', async () => {
+      try {
+        const result = await window.electronAPI.file.pickAndRead();
+        if (result && result.success) {
+          addPendingAttachment(result);
+        }
+      } catch (err) {
+        console.error('[attach] pick error:', err);
+      }
+    });
+  }
+
+  // 첨부 미리보기 삭제 버튼 위임
+  if ($attachmentPreview) {
+    $attachmentPreview.addEventListener('click', (e) => {
+      const removeBtn = e.target.closest('.attachment-remove');
+      if (!removeBtn) return;
+      const idx = parseInt(removeBtn.dataset.index, 10);
+      if (!isNaN(idx)) removePendingAttachment(idx);
+    });
+  }
+
+  // 드래그 앤 드롭 파일 첨부
+  {
+    const dropTarget = document.getElementById('input-area') || $input;
+    dropTarget.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropTarget.classList.add('drag-over');
+    });
+    dropTarget.addEventListener('dragleave', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropTarget.classList.remove('drag-over');
+    });
+    dropTarget.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dropTarget.classList.remove('drag-over');
+      const files = e.dataTransfer?.files;
+      if (!files || files.length === 0) return;
+      const paths = [];
+      for (let i = 0; i < Math.min(files.length, 10); i++) {
+        if (files[i].path) paths.push(files[i].path);
+      }
+      if (paths.length === 0) return;
+      try {
+        const result = await window.electronAPI.file.readMultiple(paths);
+        if (result && result.success && result.files) {
+          for (const f of result.files) {
+            if (f.success) addPendingAttachment(f);
+          }
+        }
+      } catch (err) {
+        console.error('[attach] drop error:', err);
+      }
+    });
+  }
 
   // 사용자가 스크롤을 조작하면 자동 하단 고정 상태를 갱신
   $messages.addEventListener('scroll', () => {
@@ -8473,6 +8897,56 @@
     if (target === 'code') {
       void ensureCodeTabContentLoaded(body);
     }
+  });
+
+  // 승인 버튼 클릭 이벤트 위임
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.approval-btn');
+    if (!btn) return;
+    const approvalEl = btn.closest('.approval-request');
+    if (!approvalEl) return;
+
+    const streamId = approvalEl.dataset.streamId;
+    const isTextBased = approvalEl.dataset.textBased === '1';
+    const decision = btn.dataset.decision;
+    if (!streamId || !decision) return;
+
+    let actualDecision, forSession;
+    if (decision === 'accept') {
+      actualDecision = 'accept';
+      forSession = false;
+    } else if (decision === 'accept-session') {
+      actualDecision = 'accept';
+      forSession = true;
+    } else {
+      actualDecision = 'deny';
+      forSession = false;
+    }
+
+    // 승인 응답 전송
+    sendApprovalResponse(streamId, actualDecision, forSession, isTextBased);
+
+    // 활성 스트림에서 pendingApproval 제거
+    for (const [, st] of convStreams) {
+      if (st.streamId === streamId) {
+        st.pendingApproval = null;
+        break;
+      }
+    }
+
+    // 버튼 영역을 결과 표시로 교체
+    const resultText = actualDecision === 'accept'
+      ? (forSession ? '✅ 세션 허용됨' : '✅ 허용됨')
+      : '❌ 거부됨';
+    approvalEl.innerHTML = `<div class="approval-resolved">${resultText}</div>`;
+    approvalEl.classList.add('resolved');
+
+    // 3초 후 승인 결과 UI 축소
+    setTimeout(() => {
+      if (approvalEl.isConnected) {
+        approvalEl.classList.add('fade-out');
+      }
+    }, 3000);
   });
 
 })();

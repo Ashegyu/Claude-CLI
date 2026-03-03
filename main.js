@@ -11,6 +11,15 @@ const runningProcesses = new Map();
 const processBuffers = new Map(); // id → { ansiFragment: string } — ANSI 분할 방지 버퍼
 let resolvedCliPaths = {}; // command name → resolved absolute path 캐시
 const MAX_FILE_IMPORT_BYTES = 180 * 1024;
+const MAX_IMAGE_IMPORT_BYTES = 20 * 1024 * 1024; // 이미지는 20MB까지
+const MAX_PDF_IMPORT_BYTES = 10 * 1024 * 1024; // PDF는 10MB까지
+
+// 파일 확장자별 분류
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif']);
+const PDF_EXTENSIONS = new Set(['.pdf']);
+const BINARY_DOC_EXTENSIONS = new Set(['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods', '.odp']);
+const ARCHIVE_EXTENSIONS = new Set(['.zip', '.tar', '.gz', '.7z', '.rar', '.bz2']);
+
 let codexRateLimitCache = {
   ts: 0,
   filePath: '',
@@ -180,6 +189,33 @@ function normalizeRepoFilePath(inputPath, repoRoot, fallbackCwd) {
   return rel.replace(/\\/g, '/');
 }
 
+function classifyFileType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext)) return 'image';
+  if (PDF_EXTENSIONS.has(ext)) return 'pdf';
+  if (BINARY_DOC_EXTENSIONS.has(ext)) return 'document';
+  if (ARCHIVE_EXTENSIONS.has(ext)) return 'archive';
+  return 'text';
+}
+
+function getMimeType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeMap = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.bmp': 'image/bmp', '.webp': 'image/webp',
+    '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+    '.tiff': 'image/tiff', '.tif': 'image/tiff',
+    '.pdf': 'application/pdf',
+    '.doc': 'application/msword',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xls': 'application/vnd.ms-excel',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  };
+  return mimeMap[ext] || 'application/octet-stream';
+}
+
 function readTextFilePreview(targetPath) {
   try {
     if (!fs.existsSync(targetPath)) {
@@ -208,6 +244,7 @@ function readTextFilePreview(targetPath) {
     return {
       success: true,
       path: targetPath,
+      fileType: 'text',
       content: buffer.toString('utf8'),
       size: stat.size,
       truncated: stat.size > MAX_FILE_IMPORT_BYTES,
@@ -216,6 +253,85 @@ function readTextFilePreview(targetPath) {
   } catch (error) {
     return { success: false, error: error.message || '파일을 읽는 중 오류가 발생했습니다.' };
   }
+}
+
+function readFileGeneric(targetPath) {
+  try {
+    if (!fs.existsSync(targetPath)) {
+      return { success: false, error: '파일을 찾을 수 없습니다.' };
+    }
+
+    const stat = fs.statSync(targetPath);
+    if (!stat.isFile()) {
+      return { success: false, error: '파일 경로가 올바르지 않습니다.' };
+    }
+
+    const fileType = classifyFileType(targetPath);
+    const mimeType = getMimeType(targetPath);
+    const fileName = path.basename(targetPath);
+
+    if (fileType === 'image') {
+      if (stat.size > MAX_IMAGE_IMPORT_BYTES) {
+        return { success: false, error: `이미지 파일이 너무 큽니다. (최대 ${Math.round(MAX_IMAGE_IMPORT_BYTES / 1024 / 1024)}MB)` };
+      }
+      const raw = fs.readFileSync(targetPath);
+      const base64 = raw.toString('base64');
+      const dataUrl = `data:${mimeType};base64,${base64}`;
+      return {
+        success: true,
+        path: targetPath,
+        fileName,
+        fileType: 'image',
+        mimeType,
+        base64,
+        dataUrl,
+        size: stat.size,
+        truncated: false,
+      };
+    }
+
+    if (fileType === 'pdf') {
+      if (stat.size > MAX_PDF_IMPORT_BYTES) {
+        return { success: false, error: `PDF 파일이 너무 큽니다. (최대 ${Math.round(MAX_PDF_IMPORT_BYTES / 1024 / 1024)}MB)` };
+      }
+      const raw = fs.readFileSync(targetPath);
+      const base64 = raw.toString('base64');
+      return {
+        success: true,
+        path: targetPath,
+        fileName,
+        fileType: 'pdf',
+        mimeType,
+        base64,
+        size: stat.size,
+        truncated: false,
+      };
+    }
+
+    if (fileType === 'document' || fileType === 'archive') {
+      return {
+        success: true,
+        path: targetPath,
+        fileName,
+        fileType,
+        mimeType,
+        size: stat.size,
+        truncated: false,
+        content: `[${fileType === 'archive' ? '압축' : '문서'} 파일] ${fileName} (${formatFileSizeLabel(stat.size)})`,
+      };
+    }
+
+    // 텍스트 파일 (기본)
+    return readTextFilePreview(targetPath);
+  } catch (error) {
+    return { success: false, error: error.message || '파일을 읽는 중 오류가 발생했습니다.' };
+  }
+}
+
+function formatFileSizeLabel(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 // --- 작업 디렉토리 관리 ---
@@ -511,7 +627,7 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
         env,
         windowsHide: true,
         shell: false,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       };
 
       const directCodexInvocation = resolveCodexDirectInvocation(shell, resolvedShell);
@@ -688,13 +804,21 @@ ipcMain.handle('file:pickAndRead', async () => {
     title: '불러올 파일 선택',
     defaultPath: workingDirectory,
     properties: ['openFile'],
+    filters: [
+      { name: '모든 지원 파일', extensions: ['txt', 'md', 'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php', 'html', 'css', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'sh', 'bat', 'ps1', 'sql', 'r', 'swift', 'kt', 'scala', 'lua', 'pl', 'pm', 'vue', 'svelte', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tiff', 'tif', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'log', 'env'] },
+      { name: '이미지', extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tiff', 'tif'] },
+      { name: 'PDF', extensions: ['pdf'] },
+      { name: '문서', extensions: ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'] },
+      { name: '텍스트/코드', extensions: ['txt', 'md', 'js', 'ts', 'py', 'java', 'c', 'cpp', 'h', 'json', 'xml', 'yaml', 'yml', 'html', 'css', 'sql', 'sh', 'bat', 'csv', 'log'] },
+      { name: '모든 파일', extensions: ['*'] },
+    ],
   });
 
   if (result.canceled || result.filePaths.length === 0) {
     return { success: false, canceled: true, error: '파일 선택이 취소되었습니다.' };
   }
 
-  return readTextFilePreview(result.filePaths[0]);
+  return readFileGeneric(result.filePaths[0]);
 });
 
 ipcMain.handle('file:read', (event, { filePath }) => {
@@ -702,7 +826,20 @@ ipcMain.handle('file:read', (event, { filePath }) => {
   if (!resolvedPath) {
     return { success: false, error: '파일 경로를 입력하세요.' };
   }
-  return readTextFilePreview(resolvedPath);
+  return readFileGeneric(resolvedPath);
+});
+
+// 드래그 앤 드롭으로 받은 파일 경로 배열을 일괄 읽기
+ipcMain.handle('file:readMultiple', (event, { filePaths }) => {
+  if (!Array.isArray(filePaths) || filePaths.length === 0) {
+    return { success: false, error: '파일 경로가 없습니다.', files: [] };
+  }
+  const results = [];
+  for (const fp of filePaths.slice(0, 10)) { // 최대 10개
+    const resolved = resolveFilePath(fp) || fp;
+    results.push(readFileGeneric(resolved));
+  }
+  return { success: true, files: results };
 });
 
 ipcMain.handle('file:open', async (event, { filePath }) => {
