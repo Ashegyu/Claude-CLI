@@ -787,16 +787,18 @@
     { command: '/version', description: 'Codex CLI 버전', usage: '/version' },
     { command: '/help', description: '명령어 목록', usage: '/help' },
   ];
+  // 기본 모델 목록 (드롭다운 빠른 선택용) + 커스텀 입력 지원
   const MODEL_OPTIONS = [
-    { id: 'GPT-5.3-Codex', cliModel: 'gpt-5.3-codex' },
-    { id: 'GPT-5.2-Codex', cliModel: 'gpt-5.2-codex' },
-    { id: 'GPT-5.1-Codex-Max', cliModel: 'gpt-5.1-codex-max' },
-    { id: 'GPT-5.2', cliModel: 'gpt-5.2' },
-    { id: 'GPT-5.1.Codex-Mini', cliModel: 'gpt-5.1-codex-mini' },
+    { id: 'gpt-5.4-codex', cliModel: 'gpt-5.4-codex' },
+    { id: 'gpt-5.3-codex', cliModel: 'gpt-5.3-codex' },
+    { id: 'gpt-5.2-codex', cliModel: 'gpt-5.2-codex' },
+    { id: 'gpt-5.1-codex-max', cliModel: 'gpt-5.1-codex-max' },
+    { id: 'gpt-5.2', cliModel: 'gpt-5.2' },
+    { id: 'gpt-5.1-codex-mini', cliModel: 'gpt-5.1-codex-mini' },
   ];
   const MODEL_OPTION_IDS = MODEL_OPTIONS.map(item => item.id);
   const REASONING_OPTIONS = ['low', 'medium', 'high', 'extra high'];
-  const DEFAULT_MODEL_ID = 'GPT-5.3-Codex';
+  const DEFAULT_MODEL_ID = 'gpt-5.4-codex';
   const DEFAULT_REASONING = 'extra high';
   const RUNTIME_INFO_VERSION = 3;
   const STREAM_RENDER_THROTTLE_MS = 70;
@@ -1603,27 +1605,26 @@
     const raw = String(value || '').trim();
     if (!raw) return DEFAULT_MODEL_ID;
 
-    // 현재 버전 ID 저장값
+    // 목록에 있으면 그대로
     if (MODEL_OPTION_IDS.includes(raw)) return raw;
 
-    // 과거/외부 저장값 보정
+    // case-insensitive 매칭
     const lower = raw.toLowerCase();
-    if (lower === 'gpt-5.3-codex') return 'GPT-5.3-Codex';
-    if (lower === 'gpt-5.2-codex') return 'GPT-5.2-Codex';
-    if (lower === 'gpt-5.1-codex-max') return 'GPT-5.1-Codex-Max';
-    if (lower === 'gpt-5.2') return 'GPT-5.2';
-    if (lower === 'gpt-5.1.codex-mini' || lower === 'gpt-5.1-codex-mini') return 'GPT-5.1.Codex-Mini';
-    if (lower === 'gpt-5' || lower === 'gpt-5-mini' || lower === 'gpt-5-nano' || lower === 'auto') return DEFAULT_MODEL_ID;
+    const match = MODEL_OPTIONS.find(m => m.id.toLowerCase() === lower || m.cliModel === lower);
+    if (match) return match.id;
 
-    return DEFAULT_MODEL_ID;
+    if (lower === 'auto') return DEFAULT_MODEL_ID;
+
+    // 목록에 없는 커스텀 모델명도 허용 (Codex CLI가 검증)
+    return raw;
   }
 
   function getCodexCliModel(modelId) {
     const normalizedId = normalizeModelOptionId(modelId);
     const option = getModelOptionById(normalizedId);
     if (option?.cliModel) return option.cliModel;
-    const fallback = getModelOptionById(DEFAULT_MODEL_ID);
-    return fallback?.cliModel || 'gpt-5.3-codex';
+    // 커스텀 모델: 목록에 없으면 입력값 그대로 CLI에 전달
+    return normalizedId || DEFAULT_MODEL_ID;
   }
 
   function loadCodexRuntimeInfo() {
@@ -1634,7 +1635,7 @@
       const hasSavedModel = typeof saved.model === 'string' && saved.model.trim().length > 0;
       const hasSavedReasoning = typeof saved.reasoning === 'string' && saved.reasoning.trim().length > 0;
       return {
-        model: hasSavedModel && MODEL_OPTION_IDS.includes(savedModelId) ? savedModelId : DEFAULT_MODEL_ID,
+        model: hasSavedModel ? savedModelId : DEFAULT_MODEL_ID,
         reasoning: hasSavedReasoning && REASONING_OPTIONS.includes(savedReasoning) ? savedReasoning : DEFAULT_REASONING,
       };
     } catch {
@@ -1708,16 +1709,44 @@
     } else {
       return;
     }
-    $runtimeMenu.innerHTML = options.map(opt => `
+    // 모델 메뉴: 커스텀 입력 필드 추가
+    const isCustomModel = type === 'model' && !MODEL_OPTION_IDS.includes(currentValue);
+    let html = options.map(opt => `
       <button type="button" class="runtime-option ${opt === currentValue ? 'active' : ''}" data-runtime-type="${type}" data-runtime-value="${opt}">
         ${escapeHtml(labelFn(opt))}
       </button>
     `).join('');
+    if (type === 'model') {
+      html += `<div class="runtime-custom-model" style="padding:4px 8px;border-top:1px solid var(--border);">
+        <input type="text" class="runtime-custom-model-input" placeholder="커스텀 모델명 입력..." value="${isCustomModel ? escapeHtml(currentValue) : ''}" style="width:100%;padding:4px 6px;background:var(--bg-secondary);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:12px;" />
+      </div>`;
+    }
+    $runtimeMenu.innerHTML = html;
     $runtimeMenu.classList.remove('hidden');
+
+    // 커스텀 모델 입력 이벤트
+    if (type === 'model') {
+      const customInput = $runtimeMenu.querySelector('.runtime-custom-model-input');
+      if (customInput) {
+        customInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            const val = customInput.value.trim();
+            if (val) {
+              setRuntimeOption('model', val);
+              $runtimeMenu.classList.add('hidden');
+            }
+          }
+          e.stopPropagation();
+        });
+        customInput.addEventListener('click', (e) => e.stopPropagation());
+        if (isCustomModel) customInput.focus();
+      }
+    }
   }
 
   function setRuntimeOption(type, value) {
-    if (type === 'model' && MODEL_OPTION_IDS.includes(value)) {
+    if (type === 'model' && value) {
       codexRuntimeInfo.model = normalizeModelOptionId(value);
       saveCodexRuntimeInfo();
       updateRuntimeHint();
@@ -2863,13 +2892,11 @@
 
     if (command === '/model') {
       if (argText) {
+        // 목록에 있으면 매칭, 없으면 커스텀 모델로 허용
         const match = MODEL_OPTION_IDS.find(id => id.toLowerCase() === argText.toLowerCase());
-        if (match) {
-          setRuntimeOption('model', match);
-          showSlashFeedback(`모델을 ${match}(으)로 변경했습니다.`, false);
-        } else {
-          showSlashFeedback(`알 수 없는 모델: ${argText}. 사용 가능: ${MODEL_OPTION_IDS.join(', ')}`, true);
-        }
+        const modelToSet = match || argText;
+        setRuntimeOption('model', modelToSet);
+        showSlashFeedback(`모델을 ${modelToSet}(으)로 변경했습니다.`, false);
       } else {
         renderRuntimeMenu('model');
       }
@@ -6168,6 +6195,7 @@
       lines: [],
       lastSignature: '',
       pendingRawLine: '',
+      lastTransientLine: '',
     };
   }
 
@@ -6575,12 +6603,22 @@
     return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
   }
 
-  function renderStreamingResponseWithProgress(responseText, progressLines, visibleLines = STREAM_INLINE_PROGRESS_VISIBLE_LINES) {
+  function renderStreamingResponseWithProgress(responseText, progressLines, visibleLines = STREAM_INLINE_PROGRESS_VISIBLE_LINES, options = {}) {
+    const showProgress = options.showProgress !== false;
     const safeVisibleLines = Math.max(1, Number(visibleLines) || STREAM_INLINE_PROGRESS_VISIBLE_LINES);
     const rows = (Array.isArray(progressLines) ? progressLines : [])
       .map(line => normalizeDetailLine(String(line || '')))
       .filter(Boolean);
     while (rows.length < safeVisibleLines) rows.unshift('');
+
+    const answer = formatAnswerLineBreaks(String(responseText || '').trim());
+    const answerHtml = answer
+      ? renderMarkdown(answer)
+      : '<div class="streaming-answer-placeholder">응답 생성 중...</div>';
+
+    if (!showProgress) {
+      return `<div class="streaming-answer-body">${answerHtml}</div>`;
+    }
 
     const progressHtml = `<div class="stream-inline-progress">
       <div class="stream-inline-progress-title">현재 진행</div>
@@ -6592,11 +6630,6 @@
         )).join('')}
       </div>
     </div>`;
-
-    const answer = formatAnswerLineBreaks(String(responseText || '').trim());
-    const answerHtml = answer
-      ? renderMarkdown(answer)
-      : '<div class="streaming-answer-placeholder">응답 생성 중...</div>';
 
     return `${progressHtml}<div class="streaming-answer-body">${answerHtml}</div>`;
   }
@@ -6621,10 +6654,10 @@
       : Math.min(maxTop, Math.max(0, scrollState.scrollTop));
   }
 
-  function renderStreamingResponsePreview(containerEl, responseText, progressLines, visibleLines = STREAM_INLINE_PROGRESS_VISIBLE_LINES) {
+  function renderStreamingResponsePreview(containerEl, responseText, progressLines, visibleLines = STREAM_INLINE_PROGRESS_VISIBLE_LINES, options = {}) {
     if (!containerEl) return;
     const scrollState = captureInlineProgressScrollState(containerEl);
-    containerEl.innerHTML = renderStreamingResponseWithProgress(responseText, progressLines, visibleLines);
+    containerEl.innerHTML = renderStreamingResponseWithProgress(responseText, progressLines, visibleLines, options);
     restoreInlineProgressScrollState(containerEl, scrollState);
   }
 
@@ -8342,6 +8375,56 @@
     }
   }
 
+  // === Interactive 하단 dock ===
+
+  function shouldUseInteractiveBottomDock() {
+    return codexExecutionMode === 'interactive';
+  }
+
+  function ensureInteractiveStatusDock() {
+    let dock = document.getElementById('interactive-status-dock');
+    if (dock) return dock;
+
+    dock = document.createElement('div');
+    dock.id = 'interactive-status-dock';
+    dock.className = 'interactive-status-dock hidden';
+    dock.innerHTML = `
+      <div class="interactive-status-row is-status">
+        <span class="label">상태</span>
+        <span class="value" data-role="status"></span>
+      </div>
+      <div class="interactive-status-row is-progress">
+        <span class="label">진행</span>
+        <span class="value" data-role="progress"></span>
+      </div>
+    `;
+
+    const parent = $codexStatusbar?.parentElement || document.getElementById('chat-area');
+    if ($codexStatusbar && $codexStatusbar.parentElement === parent) {
+      parent.insertBefore(dock, $codexStatusbar);
+    } else {
+      parent.appendChild(dock);
+    }
+    return dock;
+  }
+
+  function updateInteractiveStatusDock(kind, text) {
+    const dock = ensureInteractiveStatusDock();
+    const valueEl = dock.querySelector(`[data-role="${kind}"]`);
+    if (!valueEl) return;
+
+    valueEl.textContent = String(text || '').trim();
+
+    const hasStatus = dock.querySelector('[data-role="status"]')?.textContent?.trim();
+    const hasProgress = dock.querySelector('[data-role="progress"]')?.textContent?.trim();
+    dock.classList.toggle('hidden', !hasStatus && !hasProgress);
+  }
+
+  function clearInteractiveStatusDock(preserveIdle = false) {
+    updateInteractiveStatusDock('progress', '');
+    updateInteractiveStatusDock('status', preserveIdle ? '입력 대기' : '');
+  }
+
   // 현재 활성 대화가 스트리밍 중인지 확인
   function isActiveConvStreaming() {
     return activeConvId && convStreams.has(activeConvId);
@@ -8366,6 +8449,7 @@
       $input.placeholder = '메시지를 입력하세요...';
       $input.classList.remove('process-input-mode');
       $btnSend.title = '전송';
+      clearInteractiveStatusDock(false);
     }
   }
 
@@ -8557,12 +8641,19 @@
     const streamId = aiMsg.id;
 
     // 대화별 스트리밍 상태 등록
-    const streamState = { streamId, elapsedTimer, liveAiEl: null, rateLimitTail: '' };
+    const streamState = {
+      streamId, elapsedTimer, liveAiEl: null, rateLimitTail: '',
+      // 멀티턴 지원용
+      currentAiMsg: aiMsg,
+      currentAiEl: aiEl,
+      betweenTurns: false,
+      turnCount: 0,
+    };
     convStreams.set(convId, streamState);
 
     // 대화 전환 후 돌아왔을 때 새로 생성된 DOM 요소를 반환
     function resolveBodyEl() {
-      const el = streamState.liveAiEl || aiEl;
+      const el = streamState.liveAiEl || streamState.currentAiEl || aiEl;
       return el.querySelector('.msg-body') || bodyEl;
     }
 
@@ -8611,21 +8702,49 @@
         renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput, sections));
         scrollToBottom();
       } else {
+        const useInteractiveDock = shouldUseInteractiveBottomDock();
         const progressLines = updateStreamingPreviewLines(previewState, fullOutput, sections);
         const previewResponse = String(sections?.response?.content || '').trim();
-        renderStreamingResponsePreview(liveBody, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+        renderStreamingResponsePreview(
+          liveBody,
+          previewResponse,
+          useInteractiveDock ? [] : progressLines,
+          STREAM_INLINE_PROGRESS_VISIBLE_LINES,
+          { showProgress: !useInteractiveDock }
+        );
         scrollToBottom();
       }
     });
 
-    const unsubStream = window.electronAPI.cli.onStream(({ id, chunk }) => {
+    const unsubStream = window.electronAPI.cli.onStream(({ id, chunk, type, replace }) => {
       if (id !== streamId || finished) return;
+      // 턴 사이 노이즈 무시 (betweenTurns 상태에서 도착하는 chunk)
+      if (streamState.betweenTurns) return;
+
+      // 1) transient 채널은 fullOutput에 넣지 않는다
+      if (type === 'status' || type === 'progress') {
+        if (shouldUseInteractiveBottomDock()) {
+          updateInteractiveStatusDock(type, chunk);
+        }
+        // progress만 previewState에 반영 (milestone 기록)
+        if (type === 'progress') {
+          const normalized = normalizeDetailLine(String(chunk || ''));
+          if (normalized && normalized !== previewState.lastTransientLine) {
+            previewState.lastTransientLine = normalized;
+            pushStreamingPreviewLine(previewState, normalized);
+          }
+        }
+        scheduleStreamRender();
+        return;
+      }
+
+      // 2) 실제 콘텐츠만 fullOutput에 누적
       fullOutput = appendStreamingChunk(fullOutput, chunk);
-      aiMsg.content = fullOutput;
+      streamState.currentAiMsg.content = fullOutput;
       applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
 
-      // 승인 요청 감지 (sendMessage)
+      // 승인 요청 감지
       if (approvalPolicy !== 'auto-approve') {
         const approval = detectApprovalRequest(chunk);
         if (approval && convId === activeConvId) {
@@ -8648,19 +8767,30 @@
       if (convId === activeConvId) {
         const liveBody = resolveBodyEl();
         const fastLines = updateStreamingPreviewFromChunk(previewState, chunk);
+        const useInteractiveDock = shouldUseInteractiveBottomDock();
         if (SHOW_STREAMING_WORK_PANEL) {
           const logEl = liveBody.querySelector('.thinking-log');
           renderThinkingLogLines(logEl, fastLines);
           scrollToBottom();
         } else {
           const previewResponse = String(latestSections?.response?.content || '').trim();
-          renderStreamingResponsePreview(liveBody, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+          renderStreamingResponsePreview(
+            liveBody,
+            previewResponse,
+            useInteractiveDock ? [] : fastLines,
+            STREAM_INLINE_PROGRESS_VISIBLE_LINES,
+            { showProgress: !useInteractiveDock }
+          );
           scrollToBottom();
         }
       }
 
-      // 현재 보고있는 대화가 아니면 DOM 업데이트 스킵 (데이터만 저장)
       scheduleStreamRender();
+    });
+
+    const unsubTurnDone = window.electronAPI.cli.onTurnDone(({ id }) => {
+      if (id !== streamId || finished) return;
+      finishTurn();
     });
 
     const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
@@ -8681,41 +8811,109 @@
     });
 
     streamState.unsubStream = unsubStream;
+    streamState.unsubTurnDone = unsubTurnDone;
     streamState.unsubDone = unsubDone;
     streamState.unsubError = unsubError;
 
+    // 턴 완료 처리 (PTY는 종료하지 않음)
+    function finishTurn() {
+      streamState.turnCount++;
+      scheduleStreamRender.cancel();
+
+      const currentMsg = streamState.currentAiMsg;
+      const currentContent = fullOutput;
+
+      // 세션 ID / 토큰 사용량 추출
+      const turnSections = parseCodexOutput(currentContent);
+      const sid = extractCodexSessionId(turnSections);
+      if (sid) conv.codexSessionId = sid;
+      const observedApproval = extractApprovalPolicyFromText(currentContent);
+      if (observedApproval) conv.lastCodexApprovalPolicy = observedApproval;
+      const usage = resolveCodexTurnUsage('', currentContent);
+      if (usage.total > 0) {
+        codexUsage.record(usage.total, parseEffort(turnSections));
+      }
+      updateCodexStatusbar(turnSections);
+
+      // 현재 대화이면 DOM 최종 렌더링 (exec와 동일한 탭/섹션 UI)
+      if (convId === activeConvId) {
+        const liveEl = document.querySelector(`.message[data-msg-id="${currentMsg.id}"]`) || streamState.currentAiEl;
+        liveEl.classList.remove('streaming');
+        const finalBody = liveEl.querySelector('.msg-body');
+        if (finalBody) {
+          finalBody.innerHTML = renderAIBody(currentMsg);
+          stickProcessStackToBottom(finalBody);
+        }
+        // 입력 placeholder 변경
+        $input.placeholder = '다음 질문을 입력하세요...';
+        $input.classList.remove('process-input-mode');
+        $btnSend.title = '전송';
+        $input.focus();
+      }
+
+      // interactive 하단 dock는 다음 입력 대기 상태로
+      if (shouldUseInteractiveBottomDock()) {
+        clearInteractiveStatusDock(true);
+      }
+
+      // fullOutput 초기화, previewState 리셋, betweenTurns 설정
+      fullOutput = '';
+      latestSections = null;
+      lastSectionsParsedAt = 0;
+      responseStarted = false;
+      previewState.lines = [];
+      previewState.lastSignature = '';
+      previewState.pendingRawLine = '';
+      previewState.lastTransientLine = '';
+      streamState.betweenTurns = true;
+
+      saveConversations();
+    }
+
     function finishStream() {
       if (finished) return;
+
+      // 진행 중인 턴이 있으면 먼저 finishTurn 처리
+      if (fullOutput && !streamState.betweenTurns) {
+        finishTurn();
+      }
+
       finished = true;
       scheduleStreamRender.cancel();
       applyRealtimeRateLimitFromChunk(streamState, '\n');
+
+      if (shouldUseInteractiveBottomDock()) {
+        clearInteractiveStatusDock(false);
+      }
 
       if (elapsedTimer) clearInterval(elapsedTimer);
       convStreams.delete(convId);
 
       // 리스너 즉시 해제 (다른 프로세스 이벤트가 이 핸들러에 도달하지 않도록)
       unsubStream();
+      unsubTurnDone();
       unsubDone();
       unsubError();
 
-      if (!String(aiMsg.content || '').trim()) {
+      const currentMsg = streamState.currentAiMsg;
+      if (!String(currentMsg.content || '').trim()) {
         if (exitCode != null && exitCode !== 0) {
-          aiMsg.role = 'error';
-          aiMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
+          currentMsg.role = 'error';
+          currentMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
         } else {
-          aiMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
+          currentMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
         }
       }
 
       // 세션 ID 추출 후 대화에 저장
-      const finalSections = parseCodexOutput(aiMsg.content || '');
+      const finalSections = parseCodexOutput(currentMsg.content || '');
       const sid = extractCodexSessionId(finalSections);
       if (sid) conv.codexSessionId = sid;
-      const observedApproval = extractApprovalPolicyFromText(aiMsg.content || '');
+      const observedApproval = extractApprovalPolicyFromText(currentMsg.content || '');
       if (observedApproval) conv.lastCodexApprovalPolicy = observedApproval;
 
       // 토큰 사용량 기록
-      const usage = resolveCodexTurnUsage(promptText, aiMsg.content || '');
+      const usage = resolveCodexTurnUsage(promptText, currentMsg.content || '');
       if (usage.total > 0) {
         codexUsage.record(usage.total, parseEffort(finalSections));
       }
@@ -8725,11 +8923,11 @@
       // 현재 보고있는 대화이면 DOM 직접 업데이트
       if (convId === activeConvId) {
         // 대화 전환 후 돌아온 경우 캡처된 aiEl이 DOM에서 제거되었을 수 있으므로 라이브 요소 조회
-        const liveEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
+        const liveEl = document.querySelector(`.message[data-msg-id="${currentMsg.id}"]`) || streamState.currentAiEl;
         liveEl.classList.remove('streaming');
         const finalBody = liveEl.querySelector('.msg-body');
         if (finalBody) {
-          finalBody.innerHTML = renderAIBody(aiMsg);
+          finalBody.innerHTML = renderAIBody(currentMsg);
           stickProcessStackToBottom(finalBody);
         }
         syncStreamingUI();
@@ -8741,14 +8939,14 @@
       saveConversations();
 
       // 코드 diff 프리로드 (코드 탭 클릭 시 즉시 표시)
-      if (aiMsg.role !== 'error') {
+      if (currentMsg.role !== 'error') {
         loadActualCodeDiffsForCurrentCwd().then(diffs => {
           if (Array.isArray(diffs) && diffs.length > 0) {
-            aiMsg.actualCodeDiffs = diffs;
-            aiMsg.actualCodeDiffsFetchedAt = Date.now();
+            currentMsg.actualCodeDiffs = diffs;
+            currentMsg.actualCodeDiffsFetchedAt = Date.now();
             saveConversations();
             if (convId === activeConvId) {
-              const le = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`);
+              const le = document.querySelector(`.message[data-msg-id="${currentMsg.id}"]`);
               const fb = le?.querySelector('.msg-body');
               const cp = fb?.querySelector('.msg-tab-content[data-tab-content="code"]');
               if (cp) cp.dataset.codeRendered = '0';
@@ -8815,6 +9013,66 @@
       $input.value = '';
       autoResizeInput();
       hideSlashMenu();
+
+      // 멀티턴: betweenTurns 상태이면 새 사용자/AI 메시지 버블 생성 후 PTY에 전송
+      const convId = activeConvId;
+      const conv = getActiveConversation();
+      const st = convStreams.get(convId);
+      if (st && st.betweenTurns && conv) {
+        const profile = PROFILES.find(p => p.id === activeProfileId) || PROFILES[0];
+
+        // 사용자 메시지 추가
+        const userMsg = {
+          id: `msg_${Date.now()}`,
+          role: 'user',
+          content: text,
+          profileId: activeProfileId,
+          timestamp: Date.now(),
+        };
+        conv.messages.push(userMsg);
+        appendMessageDOM(userMsg);
+
+        // 새 AI 메시지 플레이스홀더
+        const newAiMsg = {
+          id: `msg_${Date.now() + 1}`,
+          role: 'ai',
+          content: '',
+          profileId: activeProfileId,
+          timestamp: Date.now(),
+          actualCodeDiffs: [],
+          actualCodeDiffsFetchedAt: 0,
+        };
+        conv.messages.push(newAiMsg);
+        const newAiEl = appendMessageDOM(newAiMsg);
+        newAiEl.classList.add('streaming');
+
+        const newBodyEl = newAiEl.querySelector('.msg-body');
+        if (newBodyEl && SHOW_STREAMING_WORK_PANEL) {
+          newBodyEl.innerHTML = `<div class="thinking-indicator">
+            <div class="thinking-header">
+              <div class="thinking-dots"><span></span><span></span><span></span></div>
+              <span class="thinking-text">${profile.name} 작업 중...</span>
+              <span class="thinking-elapsed">0초</span>
+            </div>
+            <div class="thinking-log"></div>
+          </div>`;
+        }
+
+        // streamState 리셋
+        st.currentAiMsg = newAiMsg;
+        st.currentAiEl = newAiEl;
+        st.liveAiEl = null;
+        st.betweenTurns = false;
+
+        // 입력 placeholder 복원
+        $input.placeholder = '실행 중인 프로세스에 입력 보내기... (Enter 전송)';
+        $input.classList.add('process-input-mode');
+        $btnSend.title = '입력 전송';
+
+        scrollToBottom();
+        saveConversations();
+      }
+
       sendInputToProcess(text);
       return;
     }

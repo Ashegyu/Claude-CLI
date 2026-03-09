@@ -46,6 +46,293 @@ function stripAnsi(text) {
     .replace(/\uFFFD/g, '');
 }
 
+// ── 가상 터미널 스크린 버퍼 ──
+// PTY의 커서 위치 지정 출력을 올바르게 처리하여 깨끗한 텍스트 추출
+class VTermBuffer {
+  constructor(cols = 120, rows = 30) {
+    this.cols = cols;
+    this.rows = rows;
+    this.lines = Array.from({ length: rows }, () => ' '.repeat(cols));
+    this.crow = 0;  // cursor row
+    this.ccol = 0;  // cursor col
+    this.prevSnap = '';
+  }
+
+  // raw ANSI 데이터를 스크린 버퍼에 기록
+  feed(data) {
+    let i = 0;
+    while (i < data.length) {
+      // ESC 시퀀스 처리
+      if (data[i] === '\x1B') {
+        const consumed = this._consumeEsc(data, i);
+        if (consumed > 0) { i += consumed; continue; }
+        i++; continue;
+      }
+      // 일반 제어 문자
+      if (data[i] === '\r') { this.ccol = 0; i++; continue; }
+      if (data[i] === '\n') { this._linefeed(); i++; continue; }
+      if (data[i] === '\t') {
+        this.ccol = Math.min(this.cols - 1, (Math.floor(this.ccol / 8) + 1) * 8);
+        i++; continue;
+      }
+      if (data.charCodeAt(i) < 0x20) { i++; continue; } // 기타 제어문자 무시
+
+      // 표시 가능한 문자 → 버퍼에 쓰기
+      if (this.crow < this.rows && this.ccol < this.cols) {
+        const row = this.lines[this.crow];
+        this.lines[this.crow] = row.substring(0, this.ccol) + data[i] + row.substring(this.ccol + 1);
+      }
+      this.ccol++;
+      if (this.ccol >= this.cols) {
+        this.ccol = 0;
+        this._linefeed();
+      }
+      i++;
+    }
+  }
+
+  _linefeed() {
+    this.crow++;
+    if (this.crow >= this.rows) {
+      // 스크롤: 첫 줄 버리고 새 빈 줄 추가
+      this.lines.shift();
+      this.lines.push(' '.repeat(this.cols));
+      this.crow = this.rows - 1;
+    }
+  }
+
+  _consumeEsc(data, start) {
+    if (start + 1 >= data.length) return 1;
+    const next = data[start + 1];
+
+    // CSI 시퀀스: ESC [ ...
+    if (next === '[') {
+      let j = start + 2;
+      let params = '';
+      while (j < data.length && ((data[j] >= '0' && data[j] <= '9') || data[j] === ';' || data[j] === '?')) {
+        params += data[j]; j++;
+      }
+      if (j >= data.length) return data.length - start; // 불완전
+      const code = data[j];
+      const len = j - start + 1;
+      this._handleCSI(code, params);
+      return len;
+    }
+
+    // OSC 시퀀스: ESC ] ... (BEL 또는 ST로 종료)
+    if (next === ']') {
+      let j = start + 2;
+      while (j < data.length) {
+        if (data[j] === '\x07') return j - start + 1;
+        if (data[j] === '\x1B' && j + 1 < data.length && data[j + 1] === '\\') return j - start + 2;
+        j++;
+      }
+      return data.length - start;
+    }
+
+    // 기타 짧은 ESC 시퀀스 (ESC (, ESC ), ESC =, ESC > 등)
+    return 2;
+  }
+
+  _handleCSI(code, params) {
+    const nums = params.replace('?', '').split(';').map(n => parseInt(n, 10));
+    const n1 = isNaN(nums[0]) ? 1 : nums[0];
+    const n2 = isNaN(nums[1]) ? 1 : nums[1];
+
+    switch (code) {
+      case 'A': this.crow = Math.max(0, this.crow - (n1 || 1)); break;
+      case 'B': this.crow = Math.min(this.rows - 1, this.crow + (n1 || 1)); break;
+      case 'C': this.ccol = Math.min(this.cols - 1, this.ccol + (n1 || 1)); break;
+      case 'D': this.ccol = Math.max(0, this.ccol - (n1 || 1)); break;
+      case 'H': case 'f':
+        this.crow = Math.min(this.rows - 1, Math.max(0, (n1 || 1) - 1));
+        this.ccol = Math.min(this.cols - 1, Math.max(0, (n2 || 1) - 1));
+        break;
+      case 'G':
+        this.ccol = Math.min(this.cols - 1, Math.max(0, (n1 || 1) - 1));
+        break;
+      case 'J': {
+        const p = nums[0] || 0;
+        if (p === 2 || p === 3) {
+          // 전체 화면 지움
+          for (let r = 0; r < this.rows; r++) this.lines[r] = ' '.repeat(this.cols);
+          this.crow = 0; this.ccol = 0;
+        } else if (p === 0) {
+          // 커서부터 화면 끝까지 지움
+          const row = this.lines[this.crow];
+          this.lines[this.crow] = row.substring(0, this.ccol) + ' '.repeat(this.cols - this.ccol);
+          for (let r = this.crow + 1; r < this.rows; r++) this.lines[r] = ' '.repeat(this.cols);
+        } else if (p === 1) {
+          // 화면 처음부터 커서까지 지움
+          for (let r = 0; r < this.crow; r++) this.lines[r] = ' '.repeat(this.cols);
+          const row = this.lines[this.crow];
+          this.lines[this.crow] = ' '.repeat(this.ccol + 1) + row.substring(this.ccol + 1);
+        }
+        break;
+      }
+      case 'K': {
+        const p = nums[0] || 0;
+        const row = this.lines[this.crow] || ' '.repeat(this.cols);
+        if (p === 0) {
+          this.lines[this.crow] = row.substring(0, this.ccol) + ' '.repeat(this.cols - this.ccol);
+        } else if (p === 1) {
+          this.lines[this.crow] = ' '.repeat(this.ccol + 1) + row.substring(this.ccol + 1);
+        } else if (p === 2) {
+          this.lines[this.crow] = ' '.repeat(this.cols);
+        }
+        break;
+      }
+      case 'L': {
+        // 줄 삽입
+        const count = n1 || 1;
+        for (let c = 0; c < count && this.crow < this.rows; c++) {
+          this.lines.splice(this.crow, 0, ' '.repeat(this.cols));
+          this.lines.length = this.rows;
+        }
+        break;
+      }
+      case 'M': {
+        // 줄 삭제
+        const count = n1 || 1;
+        for (let c = 0; c < count && this.crow < this.rows; c++) {
+          this.lines.splice(this.crow, 1);
+          this.lines.push(' '.repeat(this.cols));
+        }
+        break;
+      }
+      // m(SGR), h/l(모드), s/u(커서저장/복원), r(스크롤영역) 등은 무시
+    }
+  }
+
+  // 현재 스크린 스냅샷을 줄 단위 텍스트로 반환
+  snapshot() {
+    return this.lines.map(l => l.trimEnd()).join('\n');
+  }
+
+  // 이전 스냅샷과 비교하여 변경된 줄만 반환
+  diff() {
+    const current = this.snapshot();
+    const prev = this.prevSnap;
+    this.prevSnap = current;
+
+    if (!prev) return '';
+
+    const curLines = current.split('\n');
+    const prevLines = prev.split('\n');
+    const changed = [];
+    for (let i = 0; i < curLines.length; i++) {
+      if (curLines[i] !== (prevLines[i] || '')) {
+        const trimmed = curLines[i].trim();
+        if (trimmed) changed.push(trimmed);
+      }
+    }
+    return changed.join('\n');
+  }
+}
+
+// statusline / TUI 노이즈 필터링
+function isNoisyLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  // 모델명 + 승인정책 패턴 (예: "o4-mini suggest workspace-write")
+  if (/^[a-z0-9][\w.-]*\s+(suggest|auto-edit|full-auto|ask-every-time)\s/.test(trimmed)) return true;
+  // 상태줄 구분자 (middle dot ·) 2개 이상
+  if ((trimmed.match(/·/g) || []).length >= 2) return true;
+  // 진행 바 문자 (블록 유니코드)
+  if (/[█▓▒░]{3,}/.test(trimmed)) return true;
+  // 구분선만으로 이루어진 줄
+  if (/^[─━═╌╍┄┅─]{5,}$/.test(trimmed)) return true;
+  // "esc to interrupt" 힌트
+  if (/esc to interrupt/i.test(trimmed)) return true;
+  // 스피너 문자로 시작
+  if (/^[◦•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏►▶▷]/.test(trimmed)) return true;
+  // MCP 서버 진행 상황
+  if (/MCP\s*servers?\s*\(/i.test(trimmed)) return true;
+  // 진행 분수
+  if (/^\(\d+\/\d+\)/.test(trimmed)) return true;
+  // 연결/작업 상태 메시지
+  if (/^(Reconnect|Work|Connect|Start)ing\.{0,3}\s*$/i.test(trimmed)) return true;
+  // 퍼센트 컨텍스트 표시
+  if (/\d+%\s*(left|used|context)/i.test(trimmed)) return true;
+  // 프롬프트 제안 마커
+  if (/^›/.test(trimmed)) return true;
+  return false;
+}
+
+// PTY transient 라인 정규화 (spinner 문자 제거, 공백 정리)
+function normalizeTransientPtyLine(line) {
+  return String(line || '')
+    .replace(/^[◦•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏►▶▷]+\s*/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// PTY 라인을 content/progress/status/ignore로 분류
+function classifyPtyLine(rawLine) {
+  const raw = String(rawLine || '');
+  const line = normalizeTransientPtyLine(raw);
+  if (!line) return { kind: 'ignore', text: '' };
+
+  // 항상 하단에 고정해서 보여줄 상태선
+  if (
+    (line.match(/·/g) || []).length >= 2 ||
+    /\d+%\s*(left|used|context)/i.test(line) ||
+    /esc to interrupt/i.test(line) ||
+    /MCP\s*servers?\s*\(/i.test(line) ||
+    /^[a-z0-9][\w.-]*\s+(suggest|auto-edit|full-auto|ask-every-time)\s/i.test(line)
+  ) {
+    return { kind: 'status', text: line };
+  }
+
+  // 한 줄에서 갱신해야 하는 진행 문구
+  if (
+    /^\(\d+\/\d+\)/.test(line) ||
+    /^(Reconnect|Work|Connect|Start|Search|Read|Analyze|Plan|Run|Apply|Review)(?:ing)?\.{0,3}\b/i.test(line) ||
+    /^[◦•⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏►▶▷]/u.test(raw)
+  ) {
+    return { kind: 'progress', text: line };
+  }
+
+  // 완전 노이즈만 버림
+  if (/^[─━═╌╍┄┅─]{5,}$/u.test(line) || /[█▓▒░]{3,}/u.test(line)) {
+    return { kind: 'ignore', text: '' };
+  }
+
+  return { kind: 'content', text: raw.trimEnd() };
+}
+
+// cli:stream 이벤트 헬퍼
+function emitCliStream(id, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('cli:stream', { id, ...payload });
+  }
+}
+
+// 턴 완료 감지: "tokens? used" 패턴 이후 숫자 줄 → 2초 무입력 시 턴 완료로 판정
+function detectTurnCompletion(buf, mainWindow, id) {
+  const text = buf.turnDetectBuffer;
+  // "X tokens" or "X tokens used" 패턴
+  if (buf.turnDetectState === 'idle') {
+    if (/\d[\d,]*\s*tokens?\b/i.test(text)) {
+      buf.turnDetectState = 'saw_tokens';
+    }
+  }
+  if (buf.turnDetectState === 'saw_tokens') {
+    // 토큰 관련 줄 이후 debounce 타이머 시작/리셋
+    if (buf.turnEndTimeout) clearTimeout(buf.turnEndTimeout);
+    buf.turnEndTimeout = setTimeout(() => {
+      const now = Date.now();
+      if (now - buf.lastTurnEndAt < 3000) return; // 3초 debounce
+      buf.lastTurnEndAt = now;
+      buf.turnDetectState = 'idle';
+      buf.turnDetectBuffer = '';
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('cli:turnDone', { id });
+      }
+    }, 2000);
+  }
+}
+
 // 미완성 ANSI 시퀀스 감지: 문자열 끝에 잘린 ESC 시퀀스가 있으면 분리
 function splitAnsiSafe(text) {
   // 끝에서 ESC(\x1B) 이후 완성되지 않은 시퀀스 찾기
@@ -726,37 +1013,94 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
       });
 
       runningProcesses.set(id, createProcessHandle('pty', proc));
-      processBuffers.set(id, { ansiFragment: '' });
+      const vterm = new VTermBuffer(120, 30);
+      processBuffers.set(id, {
+        vterm,
+        turnDetectBuffer: '',
+        turnDetectState: 'idle',
+        lastTurnEndAt: 0,
+        turnEndTimeout: null,
+        diffTimer: null,       // 디바운스 타이머
+        lastStatusLine: '',    // status 중복 방지
+        lastProgressLine: '',  // progress 중복 방지
+      });
 
       proc.onData((data) => {
         const buf = processBuffers.get(id);
         if (!buf) return;
 
-        // node-pty(Windows)는 이미 디코딩된 문자열을 전달 → 문자열 기반 처리
-        // 이전 미완성 ANSI 시퀀스와 결합
-        const textWithPrev = buf.ansiFragment + data;
-        const { clean: safeText, fragment } = splitAnsiSafe(textWithPrev);
-        buf.ansiFragment = fragment;
+        // raw ANSI 데이터를 가상 터미널에 기록 (커서 위치 지정 올바르게 처리)
+        buf.vterm.feed(data);
 
-        if (!safeText) return;
+        // 디바운스: PTY가 여러 작은 청크를 빠르게 보내므로 모아서 처리
+        if (buf.diffTimer) clearTimeout(buf.diffTimer);
+        buf.diffTimer = setTimeout(() => {
+          buf.diffTimer = null;
+          const changed = buf.vterm.diff();
+          if (!changed) return;
 
-        const clean = stripAnsi(safeText);
-        if (clean && mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
-        }
+          // 변경된 줄을 분류 후 채널별 전송
+          const contentLines = [];
+          for (const rawLine of changed.split('\n')) {
+            const item = classifyPtyLine(rawLine);
+
+            if (item.kind === 'ignore') continue;
+
+            if (item.kind === 'status') {
+              if (item.text !== buf.lastStatusLine) {
+                buf.lastStatusLine = item.text;
+                emitCliStream(id, { type: 'status', chunk: item.text, replace: true });
+              }
+              continue;
+            }
+
+            if (item.kind === 'progress') {
+              if (item.text !== buf.lastProgressLine) {
+                buf.lastProgressLine = item.text;
+                emitCliStream(id, { type: 'progress', chunk: item.text, replace: true });
+              }
+              continue;
+            }
+
+            contentLines.push(item.text);
+          }
+
+          if (contentLines.length > 0) {
+            emitCliStream(id, { type: 'stdout', chunk: contentLines.join('\n') + '\n' });
+          }
+
+          // 턴 완료 감지 (필터링 전 전체 변경 텍스트 사용)
+          buf.turnDetectBuffer = (buf.turnDetectBuffer + changed).slice(-500);
+          detectTurnCompletion(buf, mainWindow, id);
+        }, 50);
       });
 
       proc.onExit(({ exitCode }) => {
         console.log(`[CLI] exit id=${id} code=${exitCode}`);
 
-        // 잔여 ANSI 프래그먼트 플러시
         const buf = processBuffers.get(id);
-        if (buf && buf.ansiFragment && mainWindow && !mainWindow.isDestroyed()) {
-          const clean = stripAnsi(buf.ansiFragment);
-          if (clean) {
-            mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
+        if (buf) {
+          if (buf.turnEndTimeout) clearTimeout(buf.turnEndTimeout);
+          if (buf.diffTimer) clearTimeout(buf.diffTimer);
+
+          // 최종 스크린 변경분 플러시 (분류 기반)
+          const changed = buf.vterm.diff();
+          if (changed) {
+            const contentLines = [];
+            for (const rawLine of changed.split('\n')) {
+              const item = classifyPtyLine(rawLine);
+              if (item.kind === 'content') contentLines.push(item.text);
+            }
+            if (contentLines.length > 0) {
+              emitCliStream(id, { type: 'stdout', chunk: contentLines.join('\n') + '\n' });
+            }
           }
         }
+
+        // dock 비우기 이벤트
+        emitCliStream(id, { type: 'status', chunk: '', replace: true, done: true });
+        emitCliStream(id, { type: 'progress', chunk: '', replace: true, done: true });
+
         processBuffers.delete(id);
         runningProcesses.delete(id);
 

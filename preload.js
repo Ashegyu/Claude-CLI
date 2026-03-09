@@ -21,6 +21,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('cli:error', handler);
       return () => ipcRenderer.removeListener('cli:error', handler);
     },
+    onTurnDone: (cb) => {
+      const handler = (_, data) => cb(data);
+      ipcRenderer.on('cli:turnDone', handler);
+      return () => ipcRenderer.removeListener('cli:turnDone', handler);
+    },
   },
   cwd: {
     get: () => ipcRenderer.invoke('cwd:get'),
