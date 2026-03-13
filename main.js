@@ -1379,6 +1379,126 @@ ipcMain.handle('repo:getFileDiffs', async (event, arg) => {
   }
 });
 
+// --- Codex 세션 파일에서 apply_patch diff 추출 (턴별 그룹핑) ---
+function parsePatchInput(patchInput) {
+  const patchContent = patchInput.trim();
+  const fileBlocks = [];
+  const fileRegex = /\*{3}\s*(Update|Add|Delete)\s+File:\s*(.+)/gi;
+  let match;
+  const positions = [];
+
+  while ((match = fileRegex.exec(patchContent)) !== null) {
+    positions.push({
+      op: match[1].toLowerCase(),
+      file: match[2].trim().replace(/^['"]|['"]$/g, ''),
+      start: match.index + match[0].length,
+    });
+  }
+
+  for (let i = 0; i < positions.length; i++) {
+    const pos = positions[i];
+    const nextStart = i + 1 < positions.length ? positions[i + 1].start - positions[i + 1].file.length - 30 : patchContent.length;
+    const blockEnd = i + 1 < positions.length
+      ? patchContent.lastIndexOf('***', positions[i + 1].start)
+      : patchContent.length;
+    const rawBlock = patchContent.slice(pos.start, blockEnd > pos.start ? blockEnd : nextStart).trim();
+
+    const diffLines = [];
+    let hasChanges = false;
+    for (const bLine of rawBlock.split(/\r?\n/)) {
+      if (bLine.startsWith('*** End Patch')) break;
+      if (bLine.startsWith('*** ')) continue;
+      if (bLine.startsWith('+') || bLine.startsWith('-')) hasChanges = true;
+      diffLines.push(bLine);
+    }
+
+    if (hasChanges || pos.op === 'add' || pos.op === 'delete') {
+      const fp = pos.file;
+      const header = pos.op === 'add'
+        ? `diff --apply_patch a/${fp} b/${fp}\nnew file\n--- /dev/null\n+++ b/${fp}`
+        : pos.op === 'delete'
+          ? `diff --apply_patch a/${fp} b/${fp}\ndeleted file\n--- a/${fp}\n+++ /dev/null`
+          : `diff --apply_patch a/${fp} b/${fp}\n--- a/${fp}\n+++ b/${fp}`;
+      fileBlocks.push({ file: fp, diff: `${header}\n${diffLines.join('\n')}`.trim() });
+    }
+  }
+
+  if (fileBlocks.length === 0 && patchContent.includes('***')) {
+    return [{ file: '(patch)', diff: patchContent }];
+  }
+  return fileBlocks;
+}
+
+ipcMain.handle('codex:getSessionDiffs', async (event, arg) => {
+  try {
+    const sessionId = typeof arg === 'string'
+      ? arg.trim()
+      : typeof arg?.sessionId === 'string'
+        ? arg.sessionId.trim()
+        : '';
+    if (!sessionId) return { success: false, error: 'session id required', data: [] };
+
+    const turnIndex = typeof arg?.turnIndex === 'number' ? arg.turnIndex : -1;
+
+    const filePath = resolveCodexSessionFilePath(sessionId, arg?.filePath || '');
+    if (!filePath) return { success: false, error: 'session file not found', data: [] };
+
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const jsonlLines = raw.split('\n');
+
+    // 턴별로 apply_patch 그룹핑
+    // 턴 = 유저 메시지 하나에 대한 AI 응답 (user message → assistant response + tool calls)
+    const turns = []; // turns[i] = [{file, diff}, ...]
+    let currentTurn = -1;
+
+    for (const line of jsonlLines) {
+      if (!line) continue;
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+
+      const payload = obj?.payload;
+      if (!payload) continue;
+
+      // 유저 메시지 → 새 턴 시작
+      if (obj?.type === 'response_item' && payload?.type === 'message' && payload?.role === 'user') {
+        currentTurn++;
+        if (!turns[currentTurn]) turns[currentTurn] = [];
+        continue;
+      }
+
+      // apply_patch 이벤트
+      const isApplyPatch =
+        obj?.type === 'response_item' &&
+        (payload?.name === 'apply_patch' ||
+         (payload?.type === 'custom_tool_call' && payload?.name === 'apply_patch'));
+      if (!isApplyPatch) continue;
+      if (currentTurn < 0) { currentTurn = 0; turns[0] = []; }
+
+      const patchInput = typeof payload.input === 'string'
+        ? payload.input
+        : typeof payload.arguments === 'string'
+          ? payload.arguments
+          : '';
+      if (!patchInput.trim()) continue;
+
+      const blocks = parsePatchInput(patchInput);
+      turns[currentTurn].push(...blocks);
+    }
+
+    // turnIndex 지정 시 해당 턴만 반환, 아니면 전체
+    if (turnIndex >= 0) {
+      const turnData = turns[turnIndex] || [];
+      return { success: true, data: turnData, turnIndex, totalTurns: turns.length };
+    }
+
+    // 전체 턴 반환 (turns 배열 포함)
+    const allPatches = turns.flat();
+    return { success: true, data: allPatches, turns, totalTurns: turns.length };
+  } catch (error) {
+    return { success: false, error: error.message || 'session diff extraction failed', data: [] };
+  }
+});
+
 // 윈도우 컨트롤
 ipcMain.on('window:minimize', () => mainWindow?.minimize());
 ipcMain.on('window:maximize', () => {
@@ -1492,19 +1612,163 @@ function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
   return fallback || null;
 }
 
-ipcMain.handle('codex:rateLimits', () => {
+// --- PTY /status로 rate limit 가져오기 ---
+let statusPtyCache = { ts: 0, result: null };
+let statusPtyRunning = false;
+
+function fetchRateLimitsViaStatus() {
+  return new Promise((resolve) => {
+    const now = Date.now();
+    // 60초 캐시
+    if (statusPtyCache.result && now - statusPtyCache.ts < 60000) {
+      return resolve(statusPtyCache.result);
+    }
+    if (statusPtyRunning) return resolve(statusPtyCache.result || null);
+    statusPtyRunning = true;
+
+    const codexPath = resolveCliPath('codex');
+    if (!codexPath) { statusPtyRunning = false; return resolve(null); }
+
+    // PTY에서는 .cmd shim을 직접 사용 (spawn과 달리 PATH 해석이 다름)
+    let spawnCmd = codexPath;
+    let spawnArgs = [];
+
+    let output = '';
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      statusPtyRunning = false;
+      if (result) {
+        statusPtyCache = { ts: Date.now(), result };
+        console.log('[rateLimits/status] parsed:', JSON.stringify(result));
+      }
+      resolve(result);
+    };
+
+    const env = sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' });
+    let proc;
+    try {
+      proc = pty.spawn(spawnCmd, spawnArgs, {
+        name: 'xterm-256color',
+        cols: 200,
+        rows: 50,
+        cwd: workingDirectory,
+        env,
+      });
+    } catch (err) {
+      console.warn('[rateLimits/status] spawn failed:', err.message);
+      statusPtyRunning = false;
+      return resolve(null);
+    }
+
+    // 15초 전체 타임아웃
+    const hardTimeout = setTimeout(() => {
+      console.log('[rateLimits/status] timeout. output:', output.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(-1500));
+      try { proc.kill(); } catch {}
+      finish(null);
+    }, 15000);
+
+    proc.onData((data) => {
+      output += data;
+    });
+
+    proc.onExit(() => {
+      clearTimeout(hardTimeout);
+      console.log('[rateLimits/status] exit. output:', output.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(-1500));
+      const parsed = parseStatusOutput(output);
+      finish(parsed);
+    });
+
+    // 3초 후 /status 전송, 그 후 3초 대기 후 /exit
+    setTimeout(() => {
+      if (done) return;
+      proc.write('/status\r');
+      setTimeout(() => {
+        if (done) return;
+        // 파싱 시도 후 종료
+        const parsed = parseStatusOutput(output);
+        if (parsed) {
+          try { proc.write('/exit\r'); } catch {}
+          setTimeout(() => { try { proc.kill(); } catch {} }, 2000);
+          clearTimeout(hardTimeout);
+          finish(parsed);
+        } else {
+          // 아직 못 파싱 → 좀 더 대기
+          setTimeout(() => {
+            if (done) return;
+            const retryParsed = parseStatusOutput(output);
+            try { proc.write('/exit\r'); } catch {}
+            setTimeout(() => { try { proc.kill(); } catch {} }, 2000);
+            clearTimeout(hardTimeout);
+            finish(retryParsed);
+          }, 3000);
+        }
+      }, 3000);
+    }, 3000);
+  });
+}
+
+function parseStatusOutput(raw) {
+  // ANSI 이스케이프 제거
+  const text = String(raw || '').replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+
+  // 패턴1: "5h: XX%" 또는 "5-hour: XX%"
+  const h5Match = text.match(/5[\s-]*h(?:our)?[^\d]*?(\d+(?:\.\d+)?)\s*%/i);
+  const weeklyMatch = text.match(/week(?:ly)?[^\d]*?(\d+(?:\.\d+)?)\s*%/i);
+
+  // 패턴2: "XX% of 5h" 또는 "XX% of weekly"
+  const h5Match2 = !h5Match ? text.match(/(\d+(?:\.\d+)?)\s*%[^%]*5[\s-]*h/i) : null;
+  const weeklyMatch2 = !weeklyMatch ? text.match(/(\d+(?:\.\d+)?)\s*%[^%]*week/i) : null;
+
+  // 패턴3: "remaining" / "used" 키워드
+  const h5Match3 = !h5Match && !h5Match2 ? text.match(/5[\s-]*h[^%\n]*?(\d+(?:\.\d+)?)\s*%\s*(used|remaining|left|남음|사용)/i) : null;
+  const weeklyMatch3 = !weeklyMatch && !weeklyMatch2 ? text.match(/week[^%\n]*?(\d+(?:\.\d+)?)\s*%\s*(used|remaining|left|남음|사용)/i) : null;
+
+  const h5Pct = h5Match ? parseFloat(h5Match[1])
+    : h5Match2 ? parseFloat(h5Match2[1])
+    : h5Match3 ? parseFloat(h5Match3[1])
+    : null;
+  const weeklyPct = weeklyMatch ? parseFloat(weeklyMatch[1])
+    : weeklyMatch2 ? parseFloat(weeklyMatch2[1])
+    : weeklyMatch3 ? parseFloat(weeklyMatch3[1])
+    : null;
+
+  if (h5Pct === null && weeklyPct === null) return null;
+
+  // "used"인 경우 반전, 기본은 "used"로 가정 (대부분 사용량 표시)
+  const isRemaining = (match) => match && /remaining|left|남음/i.test(match[0]);
+  const h5Remaining = h5Pct !== null
+    ? (isRemaining(h5Match3) ? h5Pct : Math.max(0, 100 - h5Pct))
+    : null;
+  const weeklyRemaining = weeklyPct !== null
+    ? (isRemaining(weeklyMatch3) ? weeklyPct : Math.max(0, 100 - weeklyPct))
+    : null;
+
+  return {
+    success: true,
+    h5Used: h5Remaining !== null ? Math.max(0, 100 - h5Remaining) : null,
+    weeklyUsed: weeklyRemaining !== null ? Math.max(0, 100 - weeklyRemaining) : null,
+    h5Remaining,
+    weeklyRemaining,
+    source: 'pty-status',
+  };
+}
+
+ipcMain.handle('codex:rateLimits', async () => {
+  console.log('[rateLimits] called');
   try {
     const sessionsDir = path.join(os.homedir(), '.codex', 'sessions');
     if (!fs.existsSync(sessionsDir)) return { success: false, error: 'no sessions dir' };
 
     const now = Date.now();
     const files = listCodexSessionFiles().slice(0, 40); // 최근 파일 우선 탐색
-    if (files.length === 0) return { success: false, error: 'no session files' };
 
     // 캐시 대상 파일이 아직 최신 후보군에 있고 mtime이 유지되면 캐시 반환
     if (
       codexRateLimitCache.result &&
-      now - codexRateLimitCache.ts < 15000
+      now - codexRateLimitCache.ts < 15000 &&
+      files.length > 0
     ) {
       const cachedFile = files.find(file => file.filePath === codexRateLimitCache.filePath);
       if (cachedFile && cachedFile.mtimeMs === codexRateLimitCache.fileMtime) {
@@ -1512,10 +1776,19 @@ ipcMain.handle('codex:rateLimits', () => {
       }
     }
 
-    for (const file of files) {
+    // 1) 가장 최신 세션 파일의 rate_limits 확인
+    //    최신 파일이 null이면 Codex CLI가 더 이상 rate_limits를 안 보내는 것 → PTY 폴백
+    const maxAge = 6 * 60 * 60 * 1000;
+    const recentFiles = files.filter(f => now - f.mtimeMs <= maxAge);
+
+    // 최신 파일(30분 이내)에서만 rate_limits 탐색
+    const freshMaxAge = 30 * 60 * 1000;
+    for (const file of recentFiles) {
+      if (now - file.mtimeMs > freshMaxAge) break;
       const resolved = parseCodexRateLimitsFromSessionFile(file.filePath, file.size);
       if (!resolved) continue;
 
+      console.log('[rateLimits] found in fresh session file:', path.basename(file.filePath));
       codexRateLimitCache = {
         ts: now,
         filePath: file.filePath,
@@ -1524,6 +1797,12 @@ ipcMain.handle('codex:rateLimits', () => {
       };
       return resolved;
     }
+    console.log('[rateLimits] no fresh rate_limits → trying PTY /status');
+
+    // 2) 폴백: interactive PTY로 /status 실행하여 파싱
+    console.log('[rateLimits] session file fallback → trying PTY /status');
+    const ptyResult = await fetchRateLimitsViaStatus();
+    if (ptyResult) return ptyResult;
 
     return { success: false, error: 'no rate_limits found' };
   } catch (err) {

@@ -60,6 +60,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     listSessions: (limit) => ipcRenderer.invoke('codex:listSessions', limit),
     loadSession: (arg) => ipcRenderer.invoke('codex:loadSession', arg),
     deleteSession: (arg) => ipcRenderer.invoke('codex:deleteSession', arg),
+    getSessionDiffs: (arg) => ipcRenderer.invoke('codex:getSessionDiffs', arg),
   },
   store: {
     loadConversations: () => ipcRenderer.invoke('store:loadConversations'),

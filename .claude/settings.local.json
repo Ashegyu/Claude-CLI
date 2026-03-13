@@ -60,7 +60,15 @@
       "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build 2>&1 | tail -20)",
       "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build 2>&1 | tail -5)",
       "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && sed -i 's/newConversation\\(undefined, { skipAutoSession: true }\\)/newConversation\\(\\)/g' renderer/app.js && sed -i 's/newConversation\\(mode\\)/newConversation\\(\\)/g' renderer/app.js && echo \"done\")",
-      "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build)"
+      "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build)",
+      "Bash(grep \"rate_limits\" ~/.codex/sessions/2026/03/13/rollout-2026-03-13T21-40-10-019ce736-2364-73d2-875d-bb32cd3f59a1.jsonl 2>/dev/null | tail -1 | python3 -c \"import sys,json; obj=json.loads\\(sys.stdin.read\\(\\)\\); print\\(json.dumps\\(obj, indent=2\\)\\)\" 2>/dev/null || grep \"rate_limits\" ~/.codex/sessions/2026/03/13/rollout-2026-03-13T21-40-10-019ce736-2364-73d2-875d-bb32cd3f59a1.jsonl 2>/dev/null | tail -1 | head -c 500)",
+      "Bash(grep \"token_count\" ~/.codex/sessions/2026/03/13/rollout-2026-03-13T21-40-10-019ce736-2364-73d2-875d-bb32cd3f59a1.jsonl 2>/dev/null | tail -1 | python3 -c \"import sys,json; obj=json.loads\\(sys.stdin.read\\(\\)\\); print\\(json.dumps\\(obj['payload'], indent=2\\)\\)\" 2>/dev/null)",
+      "Bash(grep '\"task_complete\"' ~/.codex/sessions/2026/03/13/rollout-2026-03-13T21-40-10-019ce736-2364-73d2-875d-bb32cd3f59a1.jsonl 2>/dev/null | python3 -c \"import sys,json; obj=json.loads\\(sys.stdin.read\\(\\)\\); print\\(json.dumps\\(obj, indent=2\\)\\)\" 2>/dev/null | head -30)",
+      "Bash(grep \"rate_limits\" ~/.codex/sessions/2026/03/10/rollout-2026-03-10T19-46-53-019cd75b-573a-7943-a6b9-fa59ad6bf8b2.jsonl 2>/dev/null | grep -v '\"rate_limits\":null' | head -1 | python3 -c \"import sys,json; obj=json.loads\\(sys.stdin.read\\(\\)\\); rl=obj.get\\('payload',{}\\).get\\('rate_limits'\\); print\\(json.dumps\\(rl, indent=2\\)\\)\" 2>/dev/null)",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 25 npx electron . 2>&1 | grep -E \"rateLimits|status\" || echo \"no rateLimits logs found\")",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 30 npx electron . 2>&1 | grep -i \"rateLimit\" || echo \"no rateLimits logs\")",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -i \"rateLimit\")",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 40 npx electron . 2>&1 | grep -i \"rateLimit\\\\|status\")"
     ]
   }
 }

@@ -1427,7 +1427,8 @@
     for (const rawLine of lines) {
       const trimmed = String(rawLine || '').trim();
       if (!trimmed) continue;
-      if (!trimmed.includes('rate_limits') && !trimmed.includes('rateLimits')) continue;
+      // token_count 이벤트 감지 (rate_limits 또는 token_count 포함)
+      if (!trimmed.includes('token_count') && !trimmed.includes('rate_limits') && !trimmed.includes('rateLimits')) continue;
       const candidate = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
       if (!candidate) continue;
 
@@ -1442,9 +1443,37 @@
       const payload = obj?.payload || {};
       if (String(payload.type || '').toLowerCase() !== 'token_count') continue;
 
-      const live = buildLiveRateLimitSnapshot(payload.rate_limits || payload.rateLimits);
-      if (!live) continue;
-      if (mergeCodexLimitSnapshot(live)) changed = true;
+      // 1) 기존 rate_limits 필드에서 시도
+      const rateLimitsData = payload.rate_limits || payload.rateLimits;
+      if (rateLimitsData) {
+        const live = buildLiveRateLimitSnapshot(rateLimitsData);
+        if (live && mergeCodexLimitSnapshot(live)) changed = true;
+      }
+
+      // 2) rate_limits가 null이면 token usage + context window로 사용률 계산
+      if (!rateLimitsData) {
+        const info = payload.info || {};
+        const totalUsage = info.total_token_usage || {};
+        const contextWindow = Number(info.model_context_window);
+        const totalTokens = Number(totalUsage.total_tokens);
+        if (Number.isFinite(contextWindow) && contextWindow > 0 && Number.isFinite(totalTokens)) {
+          const usedPct = Math.min(100, (totalTokens / contextWindow) * 100);
+          const snapshot = {
+            h5: normalizePercent(Math.max(0, 100 - usedPct)),
+            weekly: codexLimitSnapshot.weekly, // weekly는 유지
+          };
+          if (mergeCodexLimitSnapshot(snapshot)) changed = true;
+          // token 정보도 저장 (statusbar에서 사용)
+          codexLimitSnapshot.tokenInfo = {
+            totalTokens,
+            contextWindow,
+            inputTokens: Number(totalUsage.input_tokens) || 0,
+            cachedInputTokens: Number(totalUsage.cached_input_tokens) || 0,
+            outputTokens: Number(totalUsage.output_tokens) || 0,
+            reasoningTokens: Number(totalUsage.reasoning_output_tokens) || 0,
+          };
+        }
+      }
     }
 
     if (changed) renderCodexStatusbar();
@@ -1531,6 +1560,13 @@
     return `${n.toFixed(1)}%`;
   }
 
+  function formatTokenCount(n) {
+    if (!Number.isFinite(n) || n <= 0) return '0';
+    if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+    if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+    return String(n);
+  }
+
   function renderCodexStatusbar() {
     if (!$codexStatusbar) return;
 
@@ -1561,11 +1597,39 @@
       </div>`;
     };
 
+    // token 정보가 있으면 context window 사용률 표시
+    const tokenInfo = codexLimitSnapshot.tokenInfo;
+    const hasTokenInfo = tokenInfo && Number.isFinite(tokenInfo.contextWindow) && tokenInfo.contextWindow > 0;
+
+    let tokenRow = '';
+    if (hasTokenInfo) {
+      const ctxUsedPct = Math.min(100, (tokenInfo.totalTokens / tokenInfo.contextWindow) * 100);
+      const ctxLevel = ctxUsedPct >= 90 ? 'danger' : (ctxUsedPct >= 70 ? 'warn' : '');
+      const ctxRemaining = Math.max(0, 100 - ctxUsedPct);
+      tokenRow = `<div class="codex-usage-item">
+        <div class="codex-usage-main">
+          <span class="codex-usage-label">Context</span>
+          <div class="codex-usage-bar">
+            <div class="codex-usage-fill ${ctxLevel}" style="width:${ctxRemaining}%"></div>
+          </div>
+          <span class="codex-usage-pct">${formatTokenCount(tokenInfo.totalTokens)} / ${formatTokenCount(tokenInfo.contextWindow)}</span>
+        </div>
+        <span class="codex-usage-reset">in ${formatTokenCount(tokenInfo.inputTokens)} · out ${formatTokenCount(tokenInfo.outputTokens)}</span>
+      </div>`;
+    }
+
+    // rate limit 정보가 있으면 기존 표시, 없으면 token 정보만
+    const hasRateLimits = h5Pct !== null || weeklyPct !== null;
+    let rateLimitRow = '';
+    if (hasRateLimits) {
+      rateLimitRow = `${buildUsageItem('5h', h5Pct, h5Level, codexLimitSnapshot.h5ResetAt)}
+        ${buildUsageItem('Week', weeklyPct, weeklyLevel, codexLimitSnapshot.weeklyResetAt)}`;
+    }
+
     $codexStatusbar.innerHTML = `<div class="codex-usage-row">
-      ${buildUsageItem('5h', h5Pct, h5Level, codexLimitSnapshot.h5ResetAt)}
-      ${buildUsageItem('Week', weeklyPct, weeklyLevel, codexLimitSnapshot.weeklyResetAt)}
+      ${rateLimitRow}${tokenRow}
     </div>
-    <div class="codex-usage-note">5h limit / weekly limit 자동 갱신 · 마지막 갱신 ${updatedAtText}</div>`;
+    <div class="codex-usage-note">${hasRateLimits ? '5h / weekly limit' : 'context window usage'} · 마지막 갱신 ${updatedAtText}</div>`;
   }
 
   function parseEffort(sections) {
@@ -3844,7 +3908,13 @@
         }
         attachHtml += '</div>';
       }
-      bodyContent = attachHtml + escapeHtml(msg.content);
+      const escapedContent = escapeHtml(msg.content);
+      const lineCount = (msg.content || '').split('\n').length;
+      if (lineCount > 12) {
+        bodyContent = attachHtml + `<div class="user-msg-collapsible collapsed"><div class="user-msg-text">${escapedContent}</div><button class="user-msg-toggle-btn" type="button">전체 보기 (${lineCount}줄)</button></div>`;
+      } else {
+        bodyContent = attachHtml + escapedContent;
+      }
     } else {
       bodyContent = renderAIBody(msg, { activeTab: msg.activeTab });
     }
@@ -7753,11 +7823,48 @@
   }
 
   // opts: { activeTab, isStreaming }
+  /** 렌더링된 HTML에서 h1~h3을 추출하여 목차 HTML을 생성한다 (3개 미만이면 빈 문자열) */
+  function buildTocFromHtml(html) {
+    const headingRe = /<h([1-3])\b[^>]*(?:\sid="([^"]*)")?[^>]*>(.*?)<\/h[1-3]>/gi;
+    const headings = [];
+    let m;
+    while ((m = headingRe.exec(html)) !== null) {
+      const level = parseInt(m[1], 10);
+      const existingId = m[2] || '';
+      const rawText = m[3].replace(/<[^>]*>/g, '').trim();
+      if (!rawText) continue;
+      const id = existingId || 'toc-' + rawText.toLowerCase().replace(/[^a-z0-9가-힣]+/g, '-').replace(/^-|-$/g, '');
+      headings.push({ level, id, text: rawText });
+    }
+    if (headings.length < 3) return { toc: '', headings };
+    const items = headings.map(h => {
+      const indent = h.level - 1;
+      return `<a class="toc-item toc-h${h.level}" style="padding-left:${indent * 14}px" href="#${h.id}">${escapeHtml(h.text)}</a>`;
+    }).join('');
+    const toc = `<nav class="msg-toc"><div class="toc-title">목차</div>${items}</nav>`;
+    return { toc, headings };
+  }
+
+  /** HTML 내 h1~h3에 id 속성을 삽입한다 */
+  function injectHeadingIds(html, headings) {
+    if (!headings || headings.length < 3) return html;
+    let idx = 0;
+    return html.replace(/<h([1-3])\b([^>]*)>/gi, (match, level, attrs) => {
+      if (idx >= headings.length) return match;
+      const h = headings[idx++];
+      if (/\sid=/.test(attrs)) return match;
+      return `<h${level}${attrs} id="${h.id}">`;
+    });
+  }
+
   function renderCodexStructured(sections, opts) {
     const { activeTab = 'answer', isStreaming = false, rawText = '', actualCodeDiffs = [], skipPreprocess = false } = opts || {};
     const currentTab = ['answer', 'process', 'code'].includes(activeTab) ? activeTab : 'answer';
     const finalAnswer = formatAnswerLineBreaks(sanitizeFinalAnswerText(sections.response.content || ''));
-    const responseHtml = renderMarkdown(finalAnswer || '최종 답변을 정리했습니다.', { skipPreprocess });
+    let responseHtml = renderMarkdown(finalAnswer || '최종 답변을 정리했습니다.', { skipPreprocess });
+    // 목차 삽입
+    const { toc, headings } = buildTocFromHtml(responseHtml);
+    if (toc) responseHtml = toc + injectHeadingIds(responseHtml, headings);
     const processHtml = renderCodexProcessBrief(sections, isStreaming, rawText);
     const shouldRenderCodeNow = currentTab === 'code';
     const codeHtml = shouldRenderCodeNow
@@ -8319,7 +8426,7 @@
 
       // 코드 diff 프리로드 (코드 탭 클릭 시 즉시 표시)
       if (aiMsg.role !== 'error') {
-        loadActualCodeDiffsForCurrentCwd().then(diffs => {
+        loadActualCodeDiffsForCurrentCwd(aiMsg).then(diffs => {
           if (Array.isArray(diffs) && diffs.length > 0) {
             aiMsg.actualCodeDiffs = diffs;
             aiMsg.actualCodeDiffsFetchedAt = Date.now();
@@ -8396,7 +8503,42 @@
     }
   }
 
-  async function loadActualCodeDiffsForCurrentCwd() {
+  function getAiMessageTurnIndex(aiMsg) {
+    const conv = getActiveConversation();
+    if (!conv || !Array.isArray(conv.messages) || !aiMsg) return -1;
+    const aiMessages = conv.messages.filter(m => m.role === 'ai' || m.role === 'assistant');
+    const idx = aiMessages.indexOf(aiMsg);
+    return idx >= 0 ? idx : -1;
+  }
+
+  async function loadSessionDiffsForMessage(aiMsg) {
+    try {
+      const conv = getActiveConversation();
+      const sessionId = conv?.codexSessionId;
+      if (!sessionId || !window.electronAPI.codex.getSessionDiffs) return null;
+
+      const turnIndex = getAiMessageTurnIndex(aiMsg);
+      const sessionResult = await window.electronAPI.codex.getSessionDiffs({
+        sessionId,
+        turnIndex: turnIndex >= 0 ? turnIndex : undefined,
+      });
+      if (sessionResult?.success && Array.isArray(sessionResult.data) && sessionResult.data.length > 0) {
+        return normalizeActualCodeDiffEntries(sessionResult.data);
+      }
+    } catch {
+      // 세션 diff 실패
+    }
+    return null;
+  }
+
+  async function loadActualCodeDiffsForCurrentCwd(aiMsg) {
+    // 1) Codex 세션 파일에서 해당 턴의 apply_patch diff 추출 시도
+    if (aiMsg) {
+      const sessionDiffs = await loadSessionDiffsForMessage(aiMsg);
+      if (sessionDiffs && sessionDiffs.length > 0) return sessionDiffs;
+    }
+
+    // 2) 폴백: git diff 기반
     try {
       const result = await window.electronAPI.repo.getFileDiffs({
         cwd: currentCwd,
@@ -8427,7 +8569,7 @@
     const shouldFetch = force || fetchedAt <= 0;
 
     if (shouldFetch) {
-      const nextDiffs = await loadActualCodeDiffsForCurrentCwd();
+      const nextDiffs = await loadActualCodeDiffsForCurrentCwd(aiMsg);
       aiMsg.actualCodeDiffs = nextDiffs;
       aiMsg.actualCodeDiffsFetchedAt = Date.now();
       saveConversations();
@@ -8863,7 +9005,7 @@
 
       // 코드 diff 프리로드 (코드 탭 클릭 시 즉시 표시)
       if (currentMsg.role !== 'error') {
-        loadActualCodeDiffsForCurrentCwd().then(diffs => {
+        loadActualCodeDiffsForCurrentCwd(currentMsg).then(diffs => {
           if (Array.isArray(diffs) && diffs.length > 0) {
             currentMsg.actualCodeDiffs = diffs;
             currentMsg.actualCodeDiffsFetchedAt = Date.now();
@@ -9037,11 +9179,22 @@
     });
   }
 
-  // 사용자가 스크롤을 조작하면 자동 하단 고정 상태를 갱신
+  // 사용자가 스크롤을 조작하면 자동 하단 고정 상태를 갱신 + 맨 위로 버튼 표시
+  const $scrollTopBtn = document.getElementById('btn-scroll-top');
   $messages.addEventListener('scroll', () => {
     if (suppressMessagesScrollEvent) return;
     shouldAutoScrollMessages = isMessagesNearBottom();
+    // 맨 위로 버튼: 일정 이상 스크롤 시 표시
+    if ($scrollTopBtn) {
+      const scrolled = $messages.scrollTop > 400;
+      $scrollTopBtn.classList.toggle('hidden', !scrolled);
+    }
   });
+  if ($scrollTopBtn) {
+    $scrollTopBtn.addEventListener('click', () => {
+      $messages.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  }
 
   if ($btnSidebarToggle) {
     $btnSidebarToggle.addEventListener('click', (e) => {
@@ -9304,6 +9457,25 @@
         btn.classList.remove('copied');
       }, 1500);
     });
+  });
+
+  // 사용자 메시지 접기/펼치기 (이벤트 위임)
+  document.addEventListener('click', (e) => {
+    const toggleBtn = e.target.closest('.user-msg-toggle-btn');
+    if (toggleBtn) {
+      const wrapper = toggleBtn.closest('.user-msg-collapsible');
+      if (wrapper) {
+        const isCollapsed = wrapper.classList.toggle('collapsed');
+        toggleBtn.textContent = isCollapsed
+          ? toggleBtn.textContent.replace('접기', '전체 보기')
+          : '접기';
+        if (!isCollapsed) {
+          const lineCount = (wrapper.querySelector('.user-msg-text')?.textContent || '').split('\n').length;
+          toggleBtn.textContent = '접기';
+        }
+      }
+      return;
+    }
   });
 
   // Codex 탭 전환 (이벤트 위임)
