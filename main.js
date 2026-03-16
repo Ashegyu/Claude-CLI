@@ -1612,151 +1612,216 @@ function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
   return fallback || null;
 }
 
-// --- PTY /status로 rate limit 가져오기 ---
-let statusPtyCache = { ts: 0, result: null };
-let statusPtyRunning = false;
+// --- 상주형 백그라운드 codex 프로세스로 /status 파싱 ---
+const statusDaemon = {
+  proc: null,       // PTY 프로세스
+  ready: false,     // 프롬프트 준비 완료
+  output: '',       // 누적 출력
+  lastResult: null, // 마지막 파싱 결과
+  lastTs: 0,        // 마지막 갱신 시각
+  pending: [],      // 대기 중인 resolve 콜백
+  spawning: false,
+};
+
+function ensureStatusDaemon() {
+  if (statusDaemon.proc && !statusDaemon.proc.killed) return;
+  if (statusDaemon.spawning) return;
+  statusDaemon.spawning = true;
+  statusDaemon.ready = false;
+  statusDaemon.output = '';
+
+  const codexPath = resolveCliPath('codex');
+  if (!codexPath) { statusDaemon.spawning = false; return; }
+
+  const env = sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' });
+  try {
+    statusDaemon.proc = pty.spawn(codexPath, [], {
+      name: 'xterm-256color',
+      cols: 200,
+      rows: 50,
+      cwd: workingDirectory,
+      env,
+    });
+  } catch (err) {
+    console.warn('[statusDaemon] spawn failed:', err.message);
+    statusDaemon.spawning = false;
+    return;
+  }
+
+  statusDaemon.proc.onData((data) => {
+    statusDaemon.output += data;
+    // 프롬프트 준비 감지
+    if (!statusDaemon.ready) {
+      const clean = statusDaemon.output.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+      if (/[>❯›]\s*$/m.test(clean) || clean.length > 500) {
+        statusDaemon.ready = true;
+        statusDaemon.spawning = false;
+        // 준비되자마자 첫 /status 전송
+        try { statusDaemon.proc.write('/status\r'); } catch {}
+      }
+    }
+  });
+
+  statusDaemon.proc.onExit(() => {
+    statusDaemon.proc = null;
+    statusDaemon.ready = false;
+    statusDaemon.spawning = false;
+    // 대기 중인 콜백 해소
+    for (const cb of statusDaemon.pending) cb(statusDaemon.lastResult);
+    statusDaemon.pending = [];
+  });
+
+  // 프롬프트 대기 후 초기 /status 전송
+  setTimeout(() => {
+    if (statusDaemon.proc && !statusDaemon.proc.killed) {
+      statusDaemon.ready = true;
+      statusDaemon.spawning = false;
+    }
+  }, 4000);
+}
 
 function fetchRateLimitsViaStatus() {
   return new Promise((resolve) => {
-    const now = Date.now();
-    // 60초 캐시
-    if (statusPtyCache.result && now - statusPtyCache.ts < 60000) {
-      return resolve(statusPtyCache.result);
-    }
-    if (statusPtyRunning) return resolve(statusPtyCache.result || null);
-    statusPtyRunning = true;
-
-    const codexPath = resolveCliPath('codex');
-    if (!codexPath) { statusPtyRunning = false; return resolve(null); }
-
-    // PTY에서는 .cmd shim을 직접 사용 (spawn과 달리 PATH 해석이 다름)
-    let spawnCmd = codexPath;
-    let spawnArgs = [];
-
-    let output = '';
-    let done = false;
-    const finish = (result) => {
-      if (done) return;
-      done = true;
-      statusPtyRunning = false;
-      if (result) {
-        statusPtyCache = { ts: Date.now(), result };
-        console.log('[rateLimits/status] parsed:', JSON.stringify(result));
-      }
-      resolve(result);
-    };
-
-    const env = sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' });
-    let proc;
-    try {
-      proc = pty.spawn(spawnCmd, spawnArgs, {
-        name: 'xterm-256color',
-        cols: 200,
-        rows: 50,
-        cwd: workingDirectory,
-        env,
-      });
-    } catch (err) {
-      console.warn('[rateLimits/status] spawn failed:', err.message);
-      statusPtyRunning = false;
-      return resolve(null);
+    // 10초 캐시
+    if (statusDaemon.lastResult && Date.now() - statusDaemon.lastTs < 10000) {
+      return resolve(statusDaemon.lastResult);
     }
 
-    // 15초 전체 타임아웃
-    const hardTimeout = setTimeout(() => {
-      console.log('[rateLimits/status] timeout. output:', output.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(-1500));
-      try { proc.kill(); } catch {}
-      finish(null);
-    }, 15000);
+    ensureStatusDaemon();
 
-    proc.onData((data) => {
-      output += data;
-    });
+    // 프로세스가 없거나 죽었으면 null
+    if (!statusDaemon.proc || statusDaemon.proc.killed) {
+      return resolve(statusDaemon.lastResult || null);
+    }
 
-    proc.onExit(() => {
-      clearTimeout(hardTimeout);
-      console.log('[rateLimits/status] exit. output:', output.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(-1500));
-      const parsed = parseStatusOutput(output);
-      finish(parsed);
-    });
-
-    // 3초 후 /status 전송, 그 후 3초 대기 후 /exit
-    setTimeout(() => {
-      if (done) return;
-      proc.write('/status\r');
+    // 준비 안 됐으면 잠시 후 시도
+    if (!statusDaemon.ready) {
+      statusDaemon.pending.push(resolve);
       setTimeout(() => {
-        if (done) return;
-        // 파싱 시도 후 종료
-        const parsed = parseStatusOutput(output);
-        if (parsed) {
-          try { proc.write('/exit\r'); } catch {}
-          setTimeout(() => { try { proc.kill(); } catch {} }, 2000);
-          clearTimeout(hardTimeout);
-          finish(parsed);
-        } else {
-          // 아직 못 파싱 → 좀 더 대기
-          setTimeout(() => {
-            if (done) return;
-            const retryParsed = parseStatusOutput(output);
-            try { proc.write('/exit\r'); } catch {}
-            setTimeout(() => { try { proc.kill(); } catch {} }, 2000);
-            clearTimeout(hardTimeout);
-            finish(retryParsed);
-          }, 3000);
+        // 5초 후에도 응답 없으면 기존 결과 반환
+        const idx = statusDaemon.pending.indexOf(resolve);
+        if (idx >= 0) {
+          statusDaemon.pending.splice(idx, 1);
+          resolve(statusDaemon.lastResult || null);
         }
-      }, 3000);
-    }, 3000);
+      }, 5000);
+      return;
+    }
+
+    // /status 전송 후 출력 대기
+    statusDaemon.output = ''; // 이전 출력 클리어
+    try {
+      statusDaemon.proc.write('/status\r');
+    } catch {
+      return resolve(statusDaemon.lastResult || null);
+    }
+
+    // 2초 후 파싱
+    setTimeout(() => {
+      const parsed = parseStatusOutput(statusDaemon.output);
+      if (parsed) {
+        statusDaemon.lastResult = parsed;
+        statusDaemon.lastTs = Date.now();
+      }
+      resolve(parsed || statusDaemon.lastResult || null);
+    }, 2000);
   });
 }
 
+// 앱 종료 시 데몬 정리
+function killStatusDaemon() {
+  if (statusDaemon.proc && !statusDaemon.proc.killed) {
+    try { statusDaemon.proc.write('/exit\r'); } catch {}
+    setTimeout(() => {
+      try { if (statusDaemon.proc) statusDaemon.proc.kill(); } catch {}
+    }, 1000);
+  }
+}
+
 function parseStatusOutput(raw) {
-  // ANSI 이스케이프 제거
-  const text = String(raw || '').replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+  // ANSI 이스케이프 + 제어문자 + box drawing 문자 제거
+  const text = String(raw || '')
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '')
+    .replace(/[\x00-\x08\x0e-\x1f\x7f-\x9f]/g, ' ')
+    .replace(/[│┃║]/g, ' ');
 
-  // 패턴1: "5h: XX%" 또는 "5-hour: XX%"
-  const h5Match = text.match(/5[\s-]*h(?:our)?[^\d]*?(\d+(?:\.\d+)?)\s*%/i);
-  const weeklyMatch = text.match(/week(?:ly)?[^\d]*?(\d+(?:\.\d+)?)\s*%/i);
+  // /status 패널 형식:
+  // "5h limit:  ... XX% left (resets HH:MM)"
+  // "Weekly limit: ... XX% left (resets HH:MM on DD Mon)"
+  const h5PanelMatch = text.match(/5h\s+limit\s*:.*?(\d+(?:\.\d+)?)\s*%\s*left(?:\s*\(resets?\s+([^)]+)\))?/i);
+  const weeklyPanelMatch = text.match(/weekly\s+limit\s*:.*?(\d+(?:\.\d+)?)\s*%\s*left(?:\s*\(resets?\s+([^)]+)\))?/i);
 
-  // 패턴2: "XX% of 5h" 또는 "XX% of weekly"
-  const h5Match2 = !h5Match ? text.match(/(\d+(?:\.\d+)?)\s*%[^%]*5[\s-]*h/i) : null;
-  const weeklyMatch2 = !weeklyMatch ? text.match(/(\d+(?:\.\d+)?)\s*%[^%]*week/i) : null;
+  let h5Remaining = null;
+  let weeklyRemaining = null;
+  let h5ResetText = null;
+  let weeklyResetText = null;
 
-  // 패턴3: "remaining" / "used" 키워드
-  const h5Match3 = !h5Match && !h5Match2 ? text.match(/5[\s-]*h[^%\n]*?(\d+(?:\.\d+)?)\s*%\s*(used|remaining|left|남음|사용)/i) : null;
-  const weeklyMatch3 = !weeklyMatch && !weeklyMatch2 ? text.match(/week[^%\n]*?(\d+(?:\.\d+)?)\s*%\s*(used|remaining|left|남음|사용)/i) : null;
+  if (h5PanelMatch) {
+    h5Remaining = parseFloat(h5PanelMatch[1]);
+    h5ResetText = h5PanelMatch[2] || null;
+  }
+  if (weeklyPanelMatch) {
+    weeklyRemaining = parseFloat(weeklyPanelMatch[1]);
+    weeklyResetText = weeklyPanelMatch[2] || null;
+  }
 
-  const h5Pct = h5Match ? parseFloat(h5Match[1])
-    : h5Match2 ? parseFloat(h5Match2[1])
-    : h5Match3 ? parseFloat(h5Match3[1])
-    : null;
-  const weeklyPct = weeklyMatch ? parseFloat(weeklyMatch[1])
-    : weeklyMatch2 ? parseFloat(weeklyMatch2[1])
-    : weeklyMatch3 ? parseFloat(weeklyMatch3[1])
-    : null;
+  // 패널 형식 못 찾으면 상태바 형식 시도:
+  // "100% left · 0% used · 5h 66%"
+  if (h5Remaining === null) {
+    const h5BarMatch = text.match(/5[\s-]*h\s+(\d+(?:\.\d+)?)\s*%/i);
+    if (h5BarMatch) {
+      // 상태바의 "5h XX%"는 used %
+      h5Remaining = Math.max(0, 100 - parseFloat(h5BarMatch[1]));
+    }
+  }
+  if (weeklyRemaining === null) {
+    const leftMatch = text.match(/(\d+(?:\.\d+)?)\s*%\s*left/i);
+    if (leftMatch) weeklyRemaining = parseFloat(leftMatch[1]);
+  }
 
-  if (h5Pct === null && weeklyPct === null) return null;
+  if (h5Remaining === null && weeklyRemaining === null) return null;
 
-  // "used"인 경우 반전, 기본은 "used"로 가정 (대부분 사용량 표시)
-  const isRemaining = (match) => match && /remaining|left|남음/i.test(match[0]);
-  const h5Remaining = h5Pct !== null
-    ? (isRemaining(h5Match3) ? h5Pct : Math.max(0, 100 - h5Pct))
-    : null;
-  const weeklyRemaining = weeklyPct !== null
-    ? (isRemaining(weeklyMatch3) ? weeklyPct : Math.max(0, 100 - weeklyPct))
-    : null;
+  const h5Used = h5Remaining !== null ? Math.max(0, 100 - h5Remaining) : null;
+  const weeklyUsed = weeklyRemaining !== null ? Math.max(0, 100 - weeklyRemaining) : null;
+
+  // reset 시각 파싱 ("19:06" 또는 "20:55 on 20 Mar")
+  const parseResetText = (resetText) => {
+    if (!resetText) return null;
+    const timeMatch = resetText.match(/(\d{1,2}):(\d{2})/);
+    if (!timeMatch) return null;
+    const now = new Date();
+    const resetDate = new Date(now);
+    resetDate.setHours(parseInt(timeMatch[1], 10), parseInt(timeMatch[2], 10), 0, 0);
+    // "on DD Mon" 부분이 있으면 날짜도 설정
+    const dateMatch = resetText.match(/on\s+(\d{1,2})\s+(\w+)/i);
+    if (dateMatch) {
+      const months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+      const monthIdx = months.indexOf(dateMatch[2].toLowerCase().slice(0, 3));
+      if (monthIdx >= 0) {
+        resetDate.setMonth(monthIdx, parseInt(dateMatch[1], 10));
+      }
+    }
+    // 이미 지난 시각이면 다음날로
+    if (resetDate.getTime() < now.getTime() && !dateMatch) {
+      resetDate.setDate(resetDate.getDate() + 1);
+    }
+    return Math.floor(resetDate.getTime() / 1000);
+  };
 
   return {
     success: true,
-    h5Used: h5Remaining !== null ? Math.max(0, 100 - h5Remaining) : null,
-    weeklyUsed: weeklyRemaining !== null ? Math.max(0, 100 - weeklyRemaining) : null,
+    h5Used,
+    weeklyUsed,
     h5Remaining,
     weeklyRemaining,
+    h5ResetsAt: parseResetText(h5ResetText),
+    weeklyResetsAt: parseResetText(weeklyResetText),
     source: 'pty-status',
   };
 }
 
 ipcMain.handle('codex:rateLimits', async () => {
-  console.log('[rateLimits] called');
   try {
     const sessionsDir = path.join(os.homedir(), '.codex', 'sessions');
     if (!fs.existsSync(sessionsDir)) return { success: false, error: 'no sessions dir' };
@@ -1788,7 +1853,7 @@ ipcMain.handle('codex:rateLimits', async () => {
       const resolved = parseCodexRateLimitsFromSessionFile(file.filePath, file.size);
       if (!resolved) continue;
 
-      console.log('[rateLimits] found in fresh session file:', path.basename(file.filePath));
+      // found in fresh session file
       codexRateLimitCache = {
         ts: now,
         filePath: file.filePath,
@@ -1797,10 +1862,9 @@ ipcMain.handle('codex:rateLimits', async () => {
       };
       return resolved;
     }
-    console.log('[rateLimits] no fresh rate_limits → trying PTY /status');
+    // no fresh rate_limits → trying PTY /status
 
     // 2) 폴백: interactive PTY로 /status 실행하여 파싱
-    console.log('[rateLimits] session file fallback → trying PTY /status');
     const ptyResult = await fetchRateLimitsViaStatus();
     if (ptyResult) return ptyResult;
 
@@ -2280,4 +2344,7 @@ ipcMain.on('store:saveConversationsSync', (event, data) => {
 });
 
 app.whenReady().then(createWindow);
-app.on('window-all-closed', () => app.quit());
+app.on('window-all-closed', () => {
+  killStatusDaemon();
+  app.quit();
+});

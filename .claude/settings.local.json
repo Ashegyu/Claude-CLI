@@ -68,7 +68,9 @@
       "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 25 npx electron . 2>&1 | grep -E \"rateLimits|status\" || echo \"no rateLimits logs found\")",
       "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 30 npx electron . 2>&1 | grep -i \"rateLimit\" || echo \"no rateLimits logs\")",
       "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -i \"rateLimit\")",
-      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 40 npx electron . 2>&1 | grep -i \"rateLimit\\\\|status\")"
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 40 npx electron . 2>&1 | grep -i \"rateLimit\\\\|status\")",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -iE \"rateLimit|status|limit\")",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -i \"rateLimits/pty\")"
     ]
   }
 }
