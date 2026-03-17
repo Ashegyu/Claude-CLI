@@ -40,6 +40,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   repo: {
     getFileDiffs: (arg) => ipcRenderer.invoke('repo:getFileDiffs', arg),
+    getStatus: (arg) => ipcRenderer.invoke('repo:getStatus', arg),
+    commit: (arg) => ipcRenderer.invoke('repo:commit', arg),
+    generateCommitMessage: (arg) => ipcRenderer.invoke('repo:generateCommitMessage', arg),
   },
   window: {
     minimize: () => ipcRenderer.send('window:minimize'),

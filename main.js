@@ -912,23 +912,50 @@ function resolveCodexDirectInvocation(commandName, resolvedShell) {
   };
 }
 
+function shouldUseCodexStdinPrompt(commandName, args, useSpawnMode, promptText) {
+  if (!useSpawnMode || !promptText) return false;
+
+  const rawCommand = String(commandName || '').trim();
+  const normalized = rawCommand.toLowerCase();
+  const isCodexCommand = normalized === 'codex'
+    || /(?:^|[\\/])codex(?:\.(?:cmd|ps1|exe))?$/i.test(rawCommand);
+  if (!isCodexCommand) return false;
+
+  return (Array.isArray(args) ? args : [])
+    .some((arg) => String(arg || '').trim().toLowerCase() === 'exec');
+}
+
+function formatCliArgsForLog(args, maxLen = 160) {
+  return (Array.isArray(args) ? args : []).map((arg) => {
+    const value = String(arg ?? '');
+    return value.length > maxLen
+      ? `${value.slice(0, maxLen)}... (${value.length} chars)`
+      : value;
+  });
+}
+
 // --- CLI 실행 (node-pty 기반 PTY) ---
 ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
   const shell = profile.command;
   const promptText = typeof prompt === 'string' ? prompt : '';
-  const args = promptText
-    ? [...(profile.args || []), '--', promptText]
-    : [...(profile.args || [])];
+  const baseArgs = [...(profile.args || [])];
   const runCwd = cwd || workingDirectory;
   const requestedMode = String(profile?.mode || '').trim().toLowerCase();
   const requestedPtyMode = requestedMode === 'pty' || requestedMode === 'interactive';
-  const isJsonMode = args.some((arg) => String(arg).trim().toLowerCase() === '--json');
+  const isJsonMode = baseArgs.some((arg) => String(arg).trim().toLowerCase() === '--json');
   const forceSpawnMode = process.platform === 'win32'
     && String(shell || '').toLowerCase() === 'codex'
     && !requestedPtyMode;
   const useSpawnMode = requestedPtyMode ? false : (isJsonMode || forceSpawnMode || requestedMode === 'pipe');
+  const useStdinPrompt = shouldUseCodexStdinPrompt(shell, baseArgs, useSpawnMode, promptText);
+  const args = promptText
+    ? [...baseArgs, '--', useStdinPrompt ? '-' : promptText]
+    : [...baseArgs];
 
-  console.log(`[CLI] run id=${id} shell=${shell} args=${JSON.stringify(args)} cwd=${runCwd}`);
+  const promptLog = promptText
+    ? `${promptText.length} chars/${promptText.split(/\r?\n/).length} lines via ${useStdinPrompt ? 'stdin' : 'argv'}`
+    : 'none';
+  console.log(`[CLI] run id=${id} shell=${shell} prompt=${promptLog} args=${JSON.stringify(formatCliArgsForLog(args))} cwd=${runCwd}`);
 
   try {
     const env = sanitizeCliEnv({ ...process.env, ...(profile.env || {}), FORCE_COLOR: '0' });
@@ -975,6 +1002,15 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
       const child = spawn(spawnCommand, spawnArgs, spawnOptions);
 
       runningProcesses.set(id, createProcessHandle('spawn', child));
+
+      if (useStdinPrompt && child.stdin && !child.stdin.destroyed) {
+        try {
+          const stdinPayload = /\r?\n$/.test(promptText) ? promptText : `${promptText}\n`;
+          child.stdin.end(stdinPayload);
+        } catch (err) {
+          console.warn(`[CLI] stdin prompt write failed id=${id}: ${err.message}`);
+        }
+      }
 
       child.stdout?.on('data', (data) => {
         const text = typeof data === 'string' ? data : data.toString('utf8');
@@ -1270,6 +1306,205 @@ ipcMain.handle('file:open', async (event, { filePath }) => {
     return { success: true, path: resolvedPath, line };
   } catch (error) {
     return { success: false, error: error.message || '파일을 여는 중 오류가 발생했습니다.' };
+  }
+});
+
+// --- 커밋 메시지 자동 생성 (codex exec 활용) ---
+ipcMain.handle('repo:generateCommitMessage', async (event, arg) => {
+  try {
+    const cwd = (typeof arg?.cwd === 'string' && arg.cwd.trim()) ? arg.cwd.trim() : workingDirectory;
+    const rootResult = await runGitCommandAsync(['rev-parse', '--show-toplevel'], cwd);
+    if (!rootResult.ok) return { success: false, error: 'git repository not found' };
+    const repoRoot = rootResult.stdout.trim();
+
+    // diff 수집 (staged + unstaged + untracked)
+    const [stagedDiff, unstagedDiff, untrackedFiles] = await Promise.all([
+      runGitCommandAsync(['diff', '--cached', '--no-color', '--stat'], repoRoot),
+      runGitCommandAsync(['diff', '--no-color', '--stat'], repoRoot),
+      runGitCommandAsync(['ls-files', '--others', '--exclude-standard'], repoRoot),
+    ]);
+    const [stagedDetail, unstagedDetail] = await Promise.all([
+      runGitCommandAsync(['diff', '--cached', '--no-color'], repoRoot),
+      runGitCommandAsync(['diff', '--no-color'], repoRoot),
+    ]);
+
+    let diffSummary = '';
+    if (stagedDiff.ok && stagedDiff.stdout.trim()) diffSummary += `[Staged]\n${stagedDiff.stdout.trim()}\n`;
+    if (unstagedDiff.ok && unstagedDiff.stdout.trim()) diffSummary += `[Unstaged]\n${unstagedDiff.stdout.trim()}\n`;
+    if (untrackedFiles.ok && untrackedFiles.stdout.trim()) diffSummary += `[New files]\n${untrackedFiles.stdout.trim()}\n`;
+
+    // 상세 diff (최대 4000자)
+    let detailDiff = '';
+    if (stagedDetail.ok && stagedDetail.stdout.trim()) detailDiff += stagedDetail.stdout.trim() + '\n';
+    if (unstagedDetail.ok && unstagedDetail.stdout.trim()) detailDiff += unstagedDetail.stdout.trim() + '\n';
+    if (detailDiff.length > 4000) detailDiff = detailDiff.slice(0, 4000) + '\n...(truncated)';
+
+    if (!diffSummary.trim() && !detailDiff.trim()) {
+      return { success: false, error: 'no changes to commit' };
+    }
+
+    // codex exec로 커밋 메시지 생성
+    const prompt = `Based on the following git diff, generate a concise git commit message in Korean.
+Rules:
+- First line: short summary (max 72 chars)
+- If needed, add a blank line then bullet points for details
+- Focus on WHAT changed and WHY, not HOW
+- Do NOT include any explanation or prefix, output ONLY the commit message itself
+
+Diff summary:
+${diffSummary}
+
+Diff detail:
+${detailDiff}`;
+
+    const codexPath = resolveCliPath('codex');
+    if (!codexPath) return { success: false, error: 'codex CLI not found' };
+
+    return new Promise((resolve) => {
+      const directInvocation = resolveCodexDirectInvocation('codex', codexPath);
+      const execArgs = ['-a', 'never', '-s', 'workspace-write', 'exec', '--json', '--full-auto', '--', prompt];
+
+      let spawnCmd, spawnArgs;
+      if (directInvocation) {
+        spawnCmd = directInvocation.command;
+        spawnArgs = [...directInvocation.argsPrefix, ...execArgs];
+      } else {
+        // .cmd shim 사용 시 shell 필요
+        spawnCmd = codexPath;
+        spawnArgs = execArgs;
+      }
+
+      const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(codexPath);
+      const spawnOptions = {
+        cwd: repoRoot,
+        env: sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0' }),
+        windowsHide: true,
+        shell: isWindowsCmdShim && !directInvocation,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      };
+
+      const child = spawn(spawnCmd, spawnArgs, spawnOptions);
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout?.on('data', (d) => { stdout += d.toString('utf8'); });
+      child.stderr?.on('data', (d) => { stderr += d.toString('utf8'); });
+
+      const timeout = setTimeout(() => {
+        try { child.kill(); } catch {}
+        resolve({ success: false, error: 'timeout' });
+      }, 30000);
+
+      child.on('close', () => {
+        clearTimeout(timeout);
+        // JSONL 파싱 → agent_message 추출
+        let message = '';
+        for (const line of stdout.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj?.type === 'item.completed' && obj?.item?.type === 'agent_message') {
+              message += (message ? '\n' : '') + obj.item.text;
+            }
+          } catch {}
+        }
+        message = message.trim();
+        if (!message) {
+          resolve({ success: false, error: stderr.trim() || 'no message generated' });
+        } else {
+          resolve({ success: true, message });
+        }
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timeout);
+        resolve({ success: false, error: err.message });
+      });
+    });
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// --- Git 상태 조회 ---
+ipcMain.handle('repo:getStatus', async (event, arg) => {
+  try {
+    const cwd = (typeof arg?.cwd === 'string' && arg.cwd.trim()) ? arg.cwd.trim() : workingDirectory;
+    const rootResult = await runGitCommandAsync(['rev-parse', '--show-toplevel'], cwd);
+    if (!rootResult.ok) return { success: false, error: 'git repository not found' };
+    const repoRoot = rootResult.stdout.trim();
+
+    // 변경 파일 목록
+    const statusResult = await runGitCommandAsync(['status', '--porcelain'], repoRoot);
+    if (!statusResult.ok) return { success: false, error: statusResult.stderr || 'git status failed' };
+
+    const files = [];
+    for (const line of statusResult.stdout.split(/\r?\n/)) {
+      if (!line || line.length < 4) continue;
+      const status = line.slice(0, 2).trim();
+      const filePath = line.slice(3).trim();
+      if (filePath) files.push({ status, file: filePath });
+    }
+
+    // 최근 커밋 메시지 (스타일 참고용)
+    const logResult = await runGitCommandAsync(['log', '--oneline', '-5'], repoRoot);
+    const recentCommits = logResult.ok
+      ? logResult.stdout.trim().split(/\r?\n/).filter(l => l.trim()).map(l => l.trim())
+      : [];
+
+    // diff 요약 (staged + unstaged)
+    const diffStatResult = await runGitCommandAsync(['diff', '--stat', '--no-color'], repoRoot);
+    const stagedStatResult = await runGitCommandAsync(['diff', '--cached', '--stat', '--no-color'], repoRoot);
+
+    return {
+      success: true,
+      repoRoot,
+      files,
+      recentCommits,
+      diffStat: (stagedStatResult.ok ? stagedStatResult.stdout.trim() : '') + '\n' + (diffStatResult.ok ? diffStatResult.stdout.trim() : ''),
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// --- Git 커밋 ---
+ipcMain.handle('repo:commit', async (event, arg) => {
+  try {
+    const cwd = (typeof arg?.cwd === 'string' && arg.cwd.trim()) ? arg.cwd.trim() : workingDirectory;
+    const message = typeof arg?.message === 'string' ? arg.message.trim() : '';
+    if (!message) return { success: false, error: '커밋 메시지가 비어있습니다.' };
+
+    const rootResult = await runGitCommandAsync(['rev-parse', '--show-toplevel'], cwd);
+    if (!rootResult.ok) return { success: false, error: 'git repository not found' };
+    const repoRoot = rootResult.stdout.trim();
+
+    // 모든 변경 사항 stage
+    const addResult = await runGitCommandAsync(['add', '-A'], repoRoot);
+    if (!addResult.ok) return { success: false, error: `git add failed: ${addResult.stderr}` };
+
+    // staged 파일 확인
+    const stagedResult = await runGitCommandAsync(['diff', '--cached', '--name-only'], repoRoot);
+    if (!stagedResult.ok || !stagedResult.stdout.trim()) {
+      return { success: false, error: '커밋할 변경 사항이 없습니다.' };
+    }
+
+    // 커밋 실행
+    const commitResult = await runGitCommandAsync(['commit', '-m', message], repoRoot);
+    if (!commitResult.ok) return { success: false, error: commitResult.stderr || 'git commit failed' };
+
+    // 커밋 해시
+    const hashResult = await runGitCommandAsync(['rev-parse', '--short', 'HEAD'], repoRoot);
+    const hash = hashResult.ok ? hashResult.stdout.trim() : '';
+
+    return {
+      success: true,
+      hash,
+      message,
+      output: commitResult.stdout.trim(),
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
   }
 });
 

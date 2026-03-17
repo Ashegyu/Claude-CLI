@@ -807,6 +807,10 @@
   const STREAM_RENDER_THROTTLE_MS = 30;
   const STREAM_SECTIONS_PARSE_INTERVAL_MS = 280;
   const SHOW_STREAMING_WORK_PANEL = false;
+  const USER_MESSAGE_COLLAPSE_LINE_THRESHOLD = 12;
+  const USER_MESSAGE_COLLAPSE_CHAR_THRESHOLD = 900;
+  const USER_MESSAGE_PREVIEW_LINE_LIMIT = 6;
+  const USER_MESSAGE_PREVIEW_CHAR_LIMIT = 360;
 
   // === 렌더링 캐시 (성능 최적화) ===
   const _renderCache = new Map(); // key: contentHash → rendered HTML
@@ -3849,6 +3853,49 @@
     return _convMap.get(activeConvId) || null;
   }
 
+  function countTextLines(text) {
+    const value = String(text || '');
+    if (!value) return 0;
+    return value.split(/\r?\n/).length;
+  }
+
+  function shouldCollapseUserMessage(text) {
+    const value = String(text || '');
+    if (!value) return false;
+    return countTextLines(value) > USER_MESSAGE_COLLAPSE_LINE_THRESHOLD
+      || value.length > USER_MESSAGE_COLLAPSE_CHAR_THRESHOLD;
+  }
+
+  function formatCompactCharCount(count) {
+    const value = Number(count) || 0;
+    if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M자`;
+    if (value >= 10000) return `${Math.round(value / 1000)}k자`;
+    if (value >= 1000) return `${(value / 1000).toFixed(1)}k자`;
+    return `${value}자`;
+  }
+
+  function buildCollapsedUserMessagePreview(text) {
+    const normalized = String(text || '').replace(/\r\n/g, '\n');
+    if (!normalized) return '';
+
+    const lines = normalized.split('\n');
+    let preview = lines.slice(0, USER_MESSAGE_PREVIEW_LINE_LIMIT).join('\n').trimEnd();
+    if (preview.length > USER_MESSAGE_PREVIEW_CHAR_LIMIT) {
+      preview = preview.slice(0, USER_MESSAGE_PREVIEW_CHAR_LIMIT).trimEnd();
+    }
+    if (!preview) {
+      preview = normalized.slice(0, USER_MESSAGE_PREVIEW_CHAR_LIMIT).trimEnd();
+    }
+
+    const wasTrimmed = lines.length > USER_MESSAGE_PREVIEW_LINE_LIMIT || normalized.length > preview.length;
+    return wasTrimmed ? `${preview}${preview ? '\n' : ''}...` : preview;
+  }
+
+  function buildCollapsedUserMessageMeta(text) {
+    const value = String(text || '');
+    return `긴 입력 미리보기 · ${countTextLines(value)}줄 · ${formatCompactCharCount(value.length)}`;
+  }
+
   // === 메시지 렌더링 ===
   function renderMessages() {
     const conv = getActiveConversation();
@@ -3909,9 +3956,19 @@
         attachHtml += '</div>';
       }
       const escapedContent = escapeHtml(msg.content);
-      const lineCount = (msg.content || '').split('\n').length;
-      if (lineCount > 12) {
-        bodyContent = attachHtml + `<div class="user-msg-collapsible collapsed"><div class="user-msg-text">${escapedContent}</div><button class="user-msg-toggle-btn" type="button">전체 보기 (${lineCount}줄)</button></div>`;
+      const lineCount = countTextLines(msg.content);
+      if (shouldCollapseUserMessage(msg.content)) {
+        const previewText = escapeHtml(buildCollapsedUserMessagePreview(msg.content));
+        const previewMeta = escapeHtml(buildCollapsedUserMessageMeta(msg.content));
+        const expandLabel = `전체 보기 (${lineCount}줄)`;
+        bodyContent = attachHtml + `<div class="user-msg-collapsible collapsed">
+          <div class="user-msg-preview">
+            <div class="user-msg-preview-meta">${previewMeta}</div>
+            <div class="user-msg-preview-snippet">${previewText}</div>
+          </div>
+          <div class="user-msg-text">${escapedContent}</div>
+          <button class="user-msg-toggle-btn" type="button" data-expand-label="${escapeHtml(expandLabel)}" data-collapse-label="접기">${escapeHtml(expandLabel)}</button>
+        </div>`;
       } else {
         bodyContent = attachHtml + escapedContent;
       }
@@ -9132,6 +9189,179 @@
     });
   }
 
+  // Git 커밋 버튼
+  const $btnCommit = document.getElementById('btn-commit');
+  if ($btnCommit) {
+    $btnCommit.addEventListener('click', () => void openCommitModal());
+  }
+
+  async function openCommitModal() {
+    // 기존 모달 제거
+    document.querySelector('.commit-modal-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'commit-modal-overlay';
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+
+    const modal = document.createElement('div');
+    modal.className = 'commit-modal';
+    modal.innerHTML = `<h3>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="1.05" y1="12" x2="7" y2="12"/><line x1="17.01" y1="12" x2="22.96" y2="12"/></svg>
+        Git Commit
+      </h3>
+      <div class="commit-files"><span style="color:var(--text-muted)">변경 사항 확인 중...</span></div>
+      <div class="commit-message-wrapper">
+        <textarea class="commit-message-input" placeholder="커밋 메시지를 입력하세요..." spellcheck="false"></textarea>
+        <button class="commit-btn-generate" type="button" title="AI로 커밋 메시지 자동 생성">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+          AI 생성
+        </button>
+      </div>
+      <div class="commit-actions">
+        <button class="commit-btn-cancel" type="button">취소</button>
+        <button class="commit-btn-confirm" type="button" disabled>커밋</button>
+      </div>`;
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    const filesDiv = modal.querySelector('.commit-files');
+    const msgInput = modal.querySelector('.commit-message-input');
+    const btnCancel = modal.querySelector('.commit-btn-cancel');
+    const btnConfirm = modal.querySelector('.commit-btn-confirm');
+
+    btnCancel.addEventListener('click', () => overlay.remove());
+
+    // Escape 키로 닫기
+    const escHandler = (e) => {
+      if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', escHandler); }
+    };
+    document.addEventListener('keydown', escHandler);
+
+    // 변경 사항 로드
+    try {
+      const status = await window.electronAPI.repo.getStatus({ cwd: currentCwd });
+      if (!status?.success || !status.files || status.files.length === 0) {
+        filesDiv.innerHTML = '<div class="commit-empty">커밋할 변경 사항이 없습니다.</div>';
+        return;
+      }
+
+      const fileStatusClass = (s) => {
+        if (s === 'A' || s === '??' || s === 'AM') return 'added';
+        if (s === 'M' || s === 'MM') return 'modified';
+        if (s === 'D') return 'deleted';
+        if (s === 'R' || s.startsWith('R')) return 'renamed';
+        return '';
+      };
+      const fileStatusLabel = (s) => {
+        if (s === 'A' || s === '??') return '+';
+        if (s === 'M' || s === 'MM' || s === 'AM') return '~';
+        if (s === 'D') return '-';
+        if (s.startsWith('R')) return '→';
+        return s;
+      };
+
+      filesDiv.innerHTML = status.files.map(f =>
+        `<div class="file-entry">
+          <span class="file-status ${fileStatusClass(f.status)}">${fileStatusLabel(f.status)}</span>
+          <span class="file-name">${f.file}</span>
+        </div>`
+      ).join('');
+
+      // AI 커밋 메시지 생성 버튼
+      const btnGenerate = modal.querySelector('.commit-btn-generate');
+      if (btnGenerate) {
+        btnGenerate.addEventListener('click', async () => {
+          btnGenerate.disabled = true;
+          btnGenerate.textContent = '생성 중...';
+          msgInput.placeholder = 'AI가 커밋 메시지를 생성하고 있습니다...';
+          try {
+            const result = await window.electronAPI.repo.generateCommitMessage({ cwd: currentCwd });
+            if (result?.success && result.message) {
+              msgInput.value = result.message;
+              msgInput.dispatchEvent(new Event('input'));
+              msgInput.focus();
+            } else {
+              msgInput.placeholder = `생성 실패: ${result?.error || '알 수 없는 오류'}`;
+            }
+          } catch (err) {
+            msgInput.placeholder = `생성 오류: ${err.message}`;
+          } finally {
+            btnGenerate.disabled = false;
+            btnGenerate.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> AI 생성`;
+          }
+        });
+
+        // 자동으로 AI 생성 시작
+        btnGenerate.click();
+      }
+
+      // 커밋 메시지 입력 활성화
+      btnConfirm.disabled = false;
+      msgInput.focus();
+
+      // Enter 전송 (Shift+Enter 줄바꿈)
+      msgInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey && msgInput.value.trim()) {
+          e.preventDefault();
+          btnConfirm.click();
+        }
+      });
+
+      // 메시지 비어있으면 버튼 비활성
+      msgInput.addEventListener('input', () => {
+        btnConfirm.disabled = !msgInput.value.trim();
+      });
+      btnConfirm.disabled = true;
+
+      // 커밋 실행
+      btnConfirm.addEventListener('click', async () => {
+        const msg = msgInput.value.trim();
+        if (!msg) return;
+        btnConfirm.disabled = true;
+        btnConfirm.textContent = '커밋 중...';
+        msgInput.disabled = true;
+
+        try {
+          const result = await window.electronAPI.repo.commit({ cwd: currentCwd, message: msg });
+          if (result?.success) {
+            // 성공 표시
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'commit-result success';
+            resultDiv.textContent = `✓ 커밋 완료 (${result.hash}): ${result.message}`;
+            modal.querySelector('.commit-actions').before(resultDiv);
+            msgInput.style.display = 'none';
+            filesDiv.style.display = 'none';
+            btnConfirm.style.display = 'none';
+            btnCancel.textContent = '닫기';
+            // 2초 후 자동 닫기
+            setTimeout(() => overlay.remove(), 2000);
+          } else {
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'commit-result error';
+            resultDiv.textContent = `✗ ${result?.error || '커밋 실패'}`;
+            modal.querySelector('.commit-actions').before(resultDiv);
+            btnConfirm.disabled = false;
+            btnConfirm.textContent = '커밋';
+            msgInput.disabled = false;
+          }
+        } catch (err) {
+          const resultDiv = document.createElement('div');
+          resultDiv.className = 'commit-result error';
+          resultDiv.textContent = `✗ ${err.message || '오류 발생'}`;
+          modal.querySelector('.commit-actions').before(resultDiv);
+          btnConfirm.disabled = false;
+          btnConfirm.textContent = '커밋';
+          msgInput.disabled = false;
+        }
+      });
+
+    } catch (err) {
+      filesDiv.innerHTML = `<div class="commit-empty">오류: ${err.message || '상태를 가져올 수 없습니다'}</div>`;
+    }
+  }
+
   // 첨부 미리보기 삭제 버튼 위임
   if ($attachmentPreview) {
     $attachmentPreview.addEventListener('click', (e) => {
@@ -9467,12 +9697,8 @@
       if (wrapper) {
         const isCollapsed = wrapper.classList.toggle('collapsed');
         toggleBtn.textContent = isCollapsed
-          ? toggleBtn.textContent.replace('접기', '전체 보기')
-          : '접기';
-        if (!isCollapsed) {
-          const lineCount = (wrapper.querySelector('.user-msg-text')?.textContent || '').split('\n').length;
-          toggleBtn.textContent = '접기';
-        }
+          ? (toggleBtn.dataset.expandLabel || '전체 보기')
+          : (toggleBtn.dataset.collapseLabel || '접기');
       }
       return;
     }
