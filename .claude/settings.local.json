@@ -70,7 +70,13 @@
       "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -i \"rateLimit\")",
       "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 40 npx electron . 2>&1 | grep -i \"rateLimit\\\\|status\")",
       "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -iE \"rateLimit|status|limit\")",
-      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -i \"rateLimits/pty\")"
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && timeout 35 npx electron . 2>&1 | grep -i \"rateLimits/pty\")",
+      "Bash(npm run:*)",
+      "Bash(mkdir -p \"C:/Users/GC/.codex/agents\")",
+      "Bash(cp \"C:/Users/GC/Desktop/Works/Personal/Claude CLI/.codex/agents/\"*.toml \"C:/Users/GC/.codex/agents/\")",
+      "Read(//c/Users/GC/.codex/agents/**)",
+      "Bash(python3 -c \":*)",
+      "Bash(node -e \":*)"
     ]
   }
 }

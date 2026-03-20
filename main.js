@@ -1403,13 +1403,7 @@ ${detailDiff}`;
       child.stdout?.on('data', (d) => { stdout += d.toString('utf8'); });
       child.stderr?.on('data', (d) => { stderr += d.toString('utf8'); });
 
-      const timeout = setTimeout(() => {
-        try { child.kill(); } catch {}
-        resolve({ success: false, error: 'timeout' });
-      }, 30000);
-
       child.on('close', () => {
-        clearTimeout(timeout);
         // JSONL 파싱 → agent_message 추출
         let message = '';
         for (const line of stdout.split('\n')) {
@@ -1430,7 +1424,6 @@ ${detailDiff}`;
       });
 
       child.on('error', (err) => {
-        clearTimeout(timeout);
         resolve({ success: false, error: err.message });
       });
     });
@@ -2414,6 +2407,95 @@ function parseCodexSessionConversation(filePath, options = {}) {
 
   return result;
 }
+
+// --- 서브에이전트: .codex/agents/*.toml 파일 읽기 ---
+function parseSimpleToml(text) {
+  const result = {};
+  let currentKey = null;
+  let multiLineKey = null;
+  let multiLineValue = '';
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    if (multiLineKey !== null) {
+      if (line.trimEnd() === '"""') {
+        result[multiLineKey] = multiLineValue;
+        multiLineKey = null;
+        multiLineValue = '';
+      } else {
+        multiLineValue += (multiLineValue ? '\n' : '') + line;
+      }
+      continue;
+    }
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    // [section] — 무시 (flat 구조 사용)
+    if (/^\[/.test(trimmed)) continue;
+    const kvMatch = trimmed.match(/^(\w+)\s*=\s*(.*)$/);
+    if (!kvMatch) continue;
+    const key = kvMatch[1];
+    let val = kvMatch[2].trim();
+    if (val === '"""') {
+      multiLineKey = key;
+      multiLineValue = '';
+    } else if (/^"(.*)"$/.test(val)) {
+      result[key] = val.slice(1, -1);
+    } else if (/^'(.*)'$/.test(val)) {
+      result[key] = val.slice(1, -1);
+    } else if (/^\[.*\]$/.test(val)) {
+      try { result[key] = JSON.parse(val.replace(/'/g, '"')); } catch { result[key] = val; }
+    } else if (val === 'true') {
+      result[key] = true;
+    } else if (val === 'false') {
+      result[key] = false;
+    } else if (/^[\d.]+$/.test(val)) {
+      result[key] = Number(val);
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
+
+ipcMain.handle('codex:listAgents', (event, arg) => {
+  try {
+    const rawCwd = typeof arg === 'string' ? arg : (typeof arg?.cwd === 'string' ? arg.cwd : '');
+    const projectCwd = rawCwd && rawCwd.trim() ? rawCwd.trim() : workingDirectory;
+    const agents = [];
+
+    // 1순위: 현재 대화 프로젝트 폴더의 .codex/agents/
+    // 2순위: 글로벌 ~/.codex/agents/
+    const projectAgentsDir = path.join(projectCwd, '.codex', 'agents');
+    const globalAgentsDir = path.join(os.homedir(), '.codex', 'agents');
+    const searchDirs = [projectAgentsDir, globalAgentsDir];
+
+    const seenNames = new Set();
+    for (const dir of searchDirs) {
+      if (!fs.existsSync(dir)) continue;
+      const files = fs.readdirSync(dir).filter(f => f.endsWith('.toml'));
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(path.join(dir, file), 'utf8');
+          const parsed = parseSimpleToml(content);
+          const agentName = parsed.name || file.replace(/\.toml$/i, '');
+          if (seenNames.has(agentName)) continue;
+          seenNames.add(agentName);
+          agents.push({
+            name: agentName,
+            description: parsed.description || '',
+            developer_instructions: parsed.developer_instructions || '',
+            model: parsed.model || '',
+            sandbox_mode: parsed.sandbox_mode || '',
+            source: dir === projectAgentsDir ? 'project' : 'global',
+            fileName: file,
+          });
+        } catch { /* skip malformed files */ }
+      }
+    }
+    return { success: true, data: agents };
+  } catch (err) {
+    return { success: false, error: err.message, data: [] };
+  }
+});
 
 // --- Codex 세션 목록 읽기 (~/.codex/sessions) ---
 ipcMain.handle('codex:listSessions', (event, limitArg) => {

@@ -47,7 +47,15 @@
       const cwd = typeof item.cwd === 'string' ? item.cwd : '';
       const codexSessionId = typeof item.codexSessionId === 'string' ? item.codexSessionId : null;
       const lastCodexApprovalPolicy = typeof item.lastCodexApprovalPolicy === 'string' ? item.lastCodexApprovalPolicy : '';
-      normalized.push({ id, title, messages, profileId, cwd, codexSessionId, lastCodexApprovalPolicy });
+      const parentConvId = typeof item.parentConvId === 'string' ? item.parentConvId : null;
+      const subagentMeta = (item.subagentMeta && typeof item.subagentMeta === 'object')
+        ? {
+            agentName: String(item.subagentMeta.agentName || ''),
+            description: String(item.subagentMeta.description || ''),
+            status: String(item.subagentMeta.status || 'pending'),
+          }
+        : null;
+      normalized.push({ id, title, messages, profileId, cwd, codexSessionId, lastCodexApprovalPolicy, parentConvId, subagentMeta });
     }
     return normalized;
   }
@@ -696,6 +704,7 @@
   let isStreaming = false;
   let currentStreamId = null;
   let currentCwd = '';
+  let selectedProjectCwd = '';
   let runtimeMenuType = '';
 
   // 대화별 스트리밍 상태: convId → { streamId, unsubStream, unsubDone, unsubError, elapsedTimer }
@@ -707,15 +716,17 @@
   let shouldAutoScrollMessages = true;
   let suppressMessagesScrollEvent = false;
   let historyEditingId = null;
-  // 작업폴더별 접기 상태
+  const PROJECTS_STORAGE_KEY = 'projectPaths';
+  let projectPaths = loadStoredProjectPaths(conversations);
+  // 프로젝트별 대화 목록 접기 상태
   let collapsedCwdGroups = new Set(JSON.parse(localStorage.getItem('collapsedCwdGroups') || '[]'));
   function saveCollapsedCwdGroups() {
     localStorage.setItem('collapsedCwdGroups', JSON.stringify([...collapsedCwdGroups]));
   }
   const SIDEBAR_PREF_WIDTH_KEY = 'sidebarWidthPx';
   const SIDEBAR_PREF_COLLAPSED_KEY = 'sidebarCollapsed';
-  const SIDEBAR_MIN_WIDTH = 190;
-  const SIDEBAR_MAX_WIDTH = 520;
+  const SIDEBAR_MIN_WIDTH = 280;
+  const SIDEBAR_MAX_WIDTH = 560;
   let sidebarWidthPx = null;
   let sidebarCollapsed = false;
   let sidebarResizeSession = null;
@@ -730,7 +741,7 @@
   const $btnStop = document.getElementById('btn-stop');
   const $btnSidebarToggle = document.getElementById('btn-sidebar-toggle');
   const $profileList = document.getElementById('profile-list');
-  const $historyList = document.getElementById('history-list');
+  const $projectList = document.getElementById('project-list');
   const $profileName = document.getElementById('current-profile-name');
   const $profileBadge = document.getElementById('active-profile-badge');
   const $cwdPath = document.getElementById('cwd-path');
@@ -789,6 +800,10 @@
     { command: '/features', description: 'Codex feature flag 목록', usage: '/features' },
     { command: '/version', description: 'Codex CLI 버전', usage: '/version' },
     { command: '/help', description: '명령어 목록', usage: '/help' },
+    // --- 서브에이전트 ---
+    { command: '/subagent', description: '서브에이전트 생성 (병렬 실행)', usage: '/subagent [--auto-close] [에이전트명] [프롬프트]' },
+    { command: '/auto-agent', description: '작업 자동 분배 (AI가 에이전트 배정)', usage: '/auto-agent [작업 설명]' },
+    { command: '/agents', description: '사용 가능한 에이전트 목록', usage: '/agents' },
   ];
   // 기본 모델 목록 (드롭다운 빠른 선택용) + 커스텀 입력 지원
   const MODEL_OPTIONS = [
@@ -845,6 +860,7 @@
   let codexRuntimeInfo = loadCodexRuntimeInfo();
   const codexExecutionMode = 'exec';
   let sandboxMode = localStorage.getItem('codexSandboxMode') || 'workspace-write';
+  let subagentAutoClose = localStorage.getItem('subagentAutoClose') === 'true';
   const APPROVAL_POLICY_OPTIONS = ['auto-approve', 'on-failure-or-unsafe', 'unless-allow-listed', 'always-prompt'];
   const APPROVAL_POLICY_LABELS = {
     'auto-approve': '자동 승인 (기본)',
@@ -2400,7 +2416,7 @@
     let conv = getActiveConversation();
     const shouldCreateNew = !conv || conv.messages.length > 0 || (!!conv.codexSessionId && conv.codexSessionId !== sid);
     if (shouldCreateNew) {
-      newConversation();
+      newConversation(options.cwd || '', { allowEmptyCwd: true });
       conv = getActiveConversation();
     }
     if (!conv) return { success: false, error: '대화를 생성할 수 없습니다.' };
@@ -2422,12 +2438,13 @@
       ? data.cwd
       : (typeof options.cwd === 'string' ? options.cwd : '');
     if (resolvedCwd) {
-      const setResult = await window.electronAPI.cwd.set(resolvedCwd);
-      if (setResult?.success) {
-        conv.cwd = resolvedCwd;
-        currentCwd = resolvedCwd;
-        updateCwdDisplay();
-      }
+      conv.cwd = resolvedCwd;
+      await setProjectContext(resolvedCwd, {
+        syncElectron: true,
+        allowInvalidPath: true,
+        moveProjectToFront: true,
+        render: false,
+      });
     }
 
     saveConversations();
@@ -2602,7 +2619,10 @@
     conversations = remain;
     _rebuildConvMap();
     if (removedActive) {
-      activeConvId = conversations.length > 0 ? conversations[0].id : null;
+      const selectedProjectKey = getProjectPathKey(getSelectedProjectPath());
+      activeConvId = selectedProjectKey
+        ? ((conversations.find(conv => getProjectPathKey(conv?.cwd) === selectedProjectKey) || {}).id || null)
+        : (conversations.length > 0 ? conversations[0].id : null);
     }
 
     saveConversations();
@@ -3023,11 +3043,20 @@
       if (argText) {
         const result = await window.electronAPI.cwd.set(argText);
         if (result.success) {
-          currentCwd = result.cwd;
-          localStorage.setItem('lastCwd', currentCwd);
+          const resolvedCwd = result.cwd;
+          await setProjectContext(resolvedCwd, {
+            syncElectron: false,
+            moveProjectToFront: true,
+            render: false,
+          });
           const conv = getActiveConversation();
-          if (conv) { conv.cwd = currentCwd; saveConversations(); }
-          updateCwdDisplay();
+          if (conv) {
+            conv.cwd = currentCwd;
+            saveConversations();
+          } else {
+            renderProjects();
+            renderHistory();
+          }
           showSlashFeedback(`작업 폴더: ${currentCwd}`, false);
         } else {
           showSlashFeedback(`폴더를 찾을 수 없습니다: ${argText}`, true);
@@ -3276,6 +3305,39 @@
       return true;
     }
 
+    // --- 서브에이전트 ---
+    if (command === '/agents') {
+      await showAvailableAgents();
+      return true;
+    }
+
+    if (command === '/auto-agent') {
+      if (!argText) {
+        showSlashFeedback('/auto-agent [작업 설명]을 입력하세요.\n예: /auto-agent 이 프로젝트의 보안, 성능, 코드 품질을 각각 분석해줘', true);
+        return true;
+      }
+      await autoSpawnSubagents(argText);
+      return true;
+    }
+
+    if (command === '/subagent') {
+      if (!argText) {
+        showAgentPicker();
+        return true;
+      }
+      // --auto-close 플래그 파싱
+      const hasAutoClose = /--auto-?close/i.test(argText);
+      const cleanArg = argText.replace(/--auto-?close\s*/gi, '').trim();
+      // /subagent [에이전트명] [프롬프트]
+      const parts = cleanArg.match(/^(\S+)\s+(.+)$/s);
+      if (parts) {
+        await spawnSubagentByName(parts[1], parts[2], { autoClose: hasAutoClose });
+      } else {
+        showAgentPicker(cleanArg);
+      }
+      return true;
+    }
+
     // 로컬 명령이 아닌 슬래시 커맨드는 Codex/CLI로 그대로 전달
     return false;
   }
@@ -3426,6 +3488,358 @@
     }
   }
 
+  function loadStoredProjectPaths(seedConversations = []) {
+    const merged = [];
+    const seen = new Set();
+    const append = (rawPath) => {
+      const value = String(rawPath || '').trim();
+      const key = normalizeSessionCwd(value);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      merged.push(value);
+    };
+
+    try {
+      const saved = JSON.parse(localStorage.getItem(PROJECTS_STORAGE_KEY) || '[]');
+      if (Array.isArray(saved)) {
+        for (const item of saved) append(item);
+      }
+    } catch { /* ignore */ }
+
+    for (const conv of seedConversations) {
+      append(conv?.cwd);
+    }
+
+    return merged;
+  }
+
+  function saveProjectPaths() {
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projectPaths));
+  }
+
+  function getProjectPathKey(projectPath) {
+    return normalizeSessionCwd(projectPath);
+  }
+
+  function rememberProjectPath(nextPath, options = {}) {
+    const value = String(nextPath || '').trim();
+    const key = getProjectPathKey(value);
+    if (!key) return '';
+
+    const existingIndex = projectPaths.findIndex(item => getProjectPathKey(item) === key);
+    const moveToFront = options.moveToFront === true;
+    const canonicalValue = options.preferIncoming === true || existingIndex < 0
+      ? value
+      : projectPaths[existingIndex];
+
+    if (existingIndex >= 0) {
+      projectPaths[existingIndex] = canonicalValue;
+      if (moveToFront && existingIndex > 0) {
+        projectPaths.splice(existingIndex, 1);
+        projectPaths.unshift(canonicalValue);
+      }
+    } else if (moveToFront) {
+      projectPaths.unshift(canonicalValue);
+    } else {
+      projectPaths.push(canonicalValue);
+    }
+
+    if (options.save !== false) saveProjectPaths();
+    return canonicalValue;
+  }
+
+  function syncProjectsFromConversations() {
+    const before = projectPaths.map(getProjectPathKey).join('|');
+    for (const conv of conversations) {
+      rememberProjectPath(conv?.cwd, { save: false });
+    }
+    if (projectPaths.map(getProjectPathKey).join('|') !== before) {
+      saveProjectPaths();
+    }
+  }
+
+  function getProjectConversations(projectPath) {
+    const key = getProjectPathKey(projectPath);
+    if (!key) return [];
+    // 최상위 대화만 반환 (서브에이전트 제외)
+    return conversations.filter(conv => getProjectPathKey(conv?.cwd) === key && !conv.parentConvId);
+  }
+
+  function getSubagentConversations(parentConvId) {
+    if (!parentConvId) return [];
+    return conversations.filter(conv => conv.parentConvId === parentConvId);
+  }
+
+  function getProjectConversationCount(projectPath) {
+    return getProjectConversations(projectPath).length;
+  }
+
+  function isProjectCollapsed(projectPath) {
+    const key = getProjectPathKey(projectPath);
+    if (!key) return false;
+    return collapsedCwdGroups.has(key);
+  }
+
+  function setProjectCollapsed(projectPath, nextCollapsed) {
+    const key = getProjectPathKey(projectPath);
+    if (!key) return;
+    if (nextCollapsed) collapsedCwdGroups.add(key);
+    else collapsedCwdGroups.delete(key);
+    saveCollapsedCwdGroups();
+  }
+
+  function getSelectedProjectPath() {
+    return selectedProjectCwd || currentCwd || '';
+  }
+
+  function renderProjects() {
+    if (!$projectList) return;
+
+    const activeKey = getProjectPathKey(getSelectedProjectPath());
+    if (projectPaths.length === 0) {
+      $projectList.innerHTML = '<div class="project-empty">새 프로젝트를 열어 작업 폴더를 추가하세요.</div>';
+    } else {
+      $projectList.innerHTML = projectPaths.map((projectPath) => {
+        const encodedPath = encodeURIComponent(projectPath);
+        const projectKey = getProjectPathKey(projectPath);
+        const displayName = _cwdDisplayName(projectPath);
+        const conversationsForProject = getProjectConversations(projectPath);
+        const count = getProjectConversationCount(projectPath);
+        const isActive = activeKey && getProjectPathKey(projectPath) === activeKey;
+        const isEditingProject = conversationsForProject.some(conv => conv.id === historyEditingId);
+        const isCollapsed = isEditingProject ? false : isProjectCollapsed(projectPath);
+        const chevron = isCollapsed ? '▸' : '▾';
+        const conversationsHtml = isCollapsed
+          ? ''
+          : `
+            <div class="project-conversations">
+              ${conversationsForProject.length > 0
+                ? conversationsForProject.map(c => _renderConvItem(c)).join('')
+                : '<div class="project-conversations-empty">이 프로젝트에는 아직 대화가 없습니다.</div>'}
+            </div>
+          `;
+        return `
+          <div class="project-card" data-project-key="${escapeHtml(projectKey)}">
+            <div class="project-row">
+              <button class="project-toggle-btn" data-project-toggle="${encodedPath}" title="대화 목록 ${isCollapsed ? '펼치기' : '접기'}">${chevron}</button>
+              <button class="project-item${isActive ? ' active' : ''}" data-project-select="${encodedPath}" title="${escapeHtml(projectPath)}">
+                <span class="project-info">
+                  <span class="project-name">${escapeHtml(displayName)}</span>
+                </span>
+                <span class="project-count">${count}</span>
+              </button>
+              <button class="project-action-btn project-new-chat-btn project-new-chat-icon-btn" data-project-new-chat="${encodedPath}" title="이 프로젝트에서 새 대화" aria-label="이 프로젝트에서 새 대화">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="12" y1="5" x2="12" y2="19"></line>
+                  <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+              </button>
+              <button class="project-action-btn project-delete-btn" data-project-delete="${encodedPath}" title="프로젝트 삭제" aria-label="프로젝트 삭제">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"></path>
+                  <path d="M19 6l-1 13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+                  <line x1="10" y1="11" x2="10" y2="17"></line>
+                  <line x1="14" y1="11" x2="14" y2="17"></line>
+                </svg>
+              </button>
+            </div>
+            ${conversationsHtml}
+          </div>
+        `;
+      }).join('');
+    }
+
+    if (!renderProjects._delegationReady) {
+      renderProjects._delegationReady = true;
+      $projectList.addEventListener('click', async (e) => {
+        const toggleBtn = e.target.closest('[data-project-toggle]');
+        if (toggleBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const projectPath = decodeURIComponent(toggleBtn.dataset.projectToggle || '');
+          setProjectCollapsed(projectPath, !isProjectCollapsed(projectPath));
+          renderProjects();
+          return;
+        }
+
+        const newChatBtn = e.target.closest('[data-project-new-chat]');
+        if (newChatBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const projectPath = decodeURIComponent(newChatBtn.dataset.projectNewChat || '');
+          await activateProject(projectPath, { startNewConversation: true });
+          return;
+        }
+
+        const deleteProjectBtn = e.target.closest('[data-project-delete]');
+        if (deleteProjectBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const projectPath = decodeURIComponent(deleteProjectBtn.dataset.projectDelete || '');
+          await deleteProject(projectPath);
+          return;
+        }
+
+        const selectBtn = e.target.closest('[data-project-select]');
+        if (selectBtn) {
+          e.preventDefault();
+          const projectPath = decodeURIComponent(selectBtn.dataset.projectSelect || '');
+          await activateProject(projectPath, { loadLatestConversation: true });
+          return;
+        }
+
+        const histItem = e.target.closest('.history-item');
+        if (histItem) { await loadConversation(histItem.dataset.id); setSidebarCollapsed(true); return; }
+
+        const renameBtn = e.target.closest('.history-rename-btn');
+        if (renameBtn) { e.preventDefault(); e.stopPropagation(); beginRenameConversation(renameBtn.dataset.renameId); return; }
+
+        const saveBtn = e.target.closest('.history-rename-save-btn');
+        if (saveBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const id = saveBtn.dataset.renameSaveId;
+          const input = $projectList.querySelector(`.history-rename-input[data-rename-input-id="${id}"]`);
+          commitRenameConversation(id, input?.value || '');
+          return;
+        }
+
+        const cancelBtn = e.target.closest('.history-rename-cancel-btn');
+        if (cancelBtn) { e.preventDefault(); e.stopPropagation(); cancelRenameConversation(); return; }
+
+        const delBtn = e.target.closest('.history-delete-btn');
+        if (delBtn) { e.preventDefault(); e.stopPropagation(); deleteConversation(delBtn.dataset.deleteId); return; }
+
+        // 서브에이전트 추가 버튼
+        const subagentBtn = e.target.closest('[data-subagent-parent]');
+        if (subagentBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          const parentId = subagentBtn.dataset.subagentParent;
+          // 부모 대화를 활성화한 뒤 에이전트 피커 표시
+          loadConversation(parentId).then(() => showAgentPicker());
+          return;
+        }
+      });
+
+      $projectList.addEventListener('keydown', (e) => {
+        const input = e.target.closest('.history-rename-input');
+        if (!input) return;
+        const convId = input.dataset.renameInputId;
+        if (e.key === 'Enter') { e.preventDefault(); commitRenameConversation(convId, input.value); }
+        if (e.key === 'Escape') { e.preventDefault(); cancelRenameConversation(); }
+      });
+
+      $projectList.addEventListener('mouseenter', (e) => {
+        const item = e.target.closest('.history-item');
+        if (!item) return;
+        const textEl = item.querySelector('.history-title-text');
+        if (!textEl) return;
+        const overflow = textEl.scrollWidth - item.clientWidth;
+        if (overflow > 4) {
+          const dur = Math.max(2, Math.min(overflow / 40, 8));
+          textEl.style.setProperty('--marquee-offset', `-${overflow + 20}px`);
+          textEl.style.setProperty('--marquee-duration', `${dur}s`);
+          textEl.classList.add('is-overflowing');
+        }
+      }, true);
+
+      $projectList.addEventListener('mouseleave', (e) => {
+        const item = e.target.closest('.history-item');
+        if (!item) return;
+        const textEl = item.querySelector('.history-title-text');
+        if (textEl) textEl.classList.remove('is-overflowing');
+      }, true);
+    }
+
+    if (historyEditingId) {
+      const input = $projectList.querySelector(`.history-rename-input[data-rename-input-id="${historyEditingId}"]`);
+      if (input) {
+        const conv = _convMap.get(historyEditingId);
+        input.value = conv?.title || '';
+      }
+    }
+  }
+
+  async function setProjectContext(nextPath, options = {}) {
+    const requestedPath = String(nextPath || '').trim();
+    if (!requestedPath) {
+      if (options.clearSelection === true) {
+        currentCwd = '';
+        selectedProjectCwd = '';
+        updateCwdDisplay();
+        if (options.render !== false) {
+          renderProjects();
+        }
+      }
+      return false;
+    }
+
+    let resolvedPath = requestedPath;
+    if (options.syncElectron !== false) {
+      const result = await window.electronAPI.cwd.set(requestedPath);
+      if (!result?.success && options.allowInvalidPath !== true) {
+        return false;
+      }
+      if (result?.success && typeof result.cwd === 'string' && result.cwd.trim()) {
+        resolvedPath = result.cwd.trim();
+      }
+    }
+
+    currentCwd = resolvedPath;
+    selectedProjectCwd = resolvedPath;
+    rememberProjectPath(resolvedPath, {
+      moveToFront: options.moveProjectToFront === true,
+      preferIncoming: true,
+    });
+    localStorage.setItem('lastCwd', resolvedPath);
+    updateCwdDisplay();
+
+    if (options.render !== false) {
+      renderProjects();
+    }
+    return true;
+  }
+
+  async function activateProject(projectPath, options = {}) {
+    const ok = await setProjectContext(projectPath, {
+      syncElectron: options.syncElectron,
+      moveProjectToFront: true,
+      render: false,
+    });
+    if (!ok) {
+      showSlashFeedback(`프로젝트 폴더를 열 수 없습니다: ${projectPath}`, true);
+      return false;
+    }
+
+    if (options.startNewConversation === true) {
+      const created = newConversation(currentCwd);
+      if (created) renderProjects();
+      return !!created;
+    }
+
+    const latestConversation = getProjectConversations(currentCwd)[0] || null;
+    if (latestConversation) {
+      await loadConversation(latestConversation.id, { skipProjectSync: true });
+      return true;
+    }
+
+    activeConvId = null;
+    renderMessages();
+    renderProjects();
+    syncStreamingUI();
+    updateRuntimeHint();
+    $input.focus();
+    return true;
+  }
+
+  async function openProjectPicker() {
+    const result = await window.electronAPI.cwd.select();
+    if (!result?.success || !result.cwd) return false;
+    return activateProject(result.cwd, { syncElectron: true, loadLatestConversation: true });
+  }
+
   async function initSidebarMeta() {
     if ($appVersion) {
       $appVersion.textContent = '버전 확인 중...';
@@ -3442,15 +3856,38 @@
   }
 
   // === 초기화 ===
-  let _historyDelegationReady = false;
   runInitStep('sidebar-layout', () => initSidebarLayout());
   runInitStep('sidebar-meta', () => initSidebarMeta());
   runInitStep('cwd', () => initCwd());
   runInitStep('profiles', () => renderProfiles());
-  runInitStep('history', () => renderHistory());
+  runInitStep('projects', () => renderProjects());
   runInitStep('active-profile', () => setActiveProfile(activeProfileId));
   runInitStep('statusbar', () => updateCodexStatusbar());
   runInitStep('rate-limits', () => refreshCodexRateLimits('init'));
+
+  // 서브에이전트 자동닫기 버튼
+  const $btnSubagentAutoClose = document.getElementById('btn-subagent-autoclose');
+  function updateSubagentAutoCloseBtn() {
+    if (!$btnSubagentAutoClose) return;
+    if (subagentAutoClose) {
+      $btnSubagentAutoClose.textContent = '에이전트: 자동닫기';
+      $btnSubagentAutoClose.classList.add('is-active');
+    } else {
+      $btnSubagentAutoClose.textContent = '에이전트: 유지';
+      $btnSubagentAutoClose.classList.remove('is-active');
+    }
+  }
+  updateSubagentAutoCloseBtn();
+  if ($btnSubagentAutoClose) {
+    $btnSubagentAutoClose.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      subagentAutoClose = !subagentAutoClose;
+      localStorage.setItem('subagentAutoClose', subagentAutoClose ? 'true' : 'false');
+      updateSubagentAutoCloseBtn();
+      showSlashFeedback(`서브에이전트 완료 시 ${subagentAutoClose ? '자동 닫기 (결과를 부모에 합침)' : '대화 유지'}`, false);
+    });
+  }
 
   if ($modelHint) {
     $modelHint.addEventListener('click', (e) => {
@@ -3505,46 +3942,48 @@
     // localStorage에 저장된 마지막 작업 폴더 복원
     const savedCwd = localStorage.getItem('lastCwd');
     if (savedCwd) {
-      const setResult = await window.electronAPI.cwd.set(savedCwd);
-      if (setResult.success) {
-        currentCwd = savedCwd;
-        updateCwdDisplay();
+      const restored = await setProjectContext(savedCwd, {
+        syncElectron: true,
+        moveProjectToFront: true,
+      });
+      if (restored) {
         return;
       }
     }
-    currentCwd = await window.electronAPI.cwd.get();
-    updateCwdDisplay();
+    if (activeConvId && getActiveConversation()?.cwd) return;
+    const cwd = await window.electronAPI.cwd.get();
+    if (activeConvId && getActiveConversation()?.cwd) return;
+    await setProjectContext(cwd, {
+      syncElectron: false,
+      moveProjectToFront: true,
+    });
   }
 
   function updateCwdDisplay() {
-    const short = shortenPath(currentCwd);
-    $cwdPath.textContent = short;
-    $cwdPath.title = currentCwd;
-    $cwdHint.textContent = short;
-    $cwdHint.title = currentCwd;
+    const displayPath = getSelectedProjectPath();
+    if (!displayPath) {
+      $cwdPath.textContent = '프로젝트를 선택하세요';
+      $cwdPath.title = '';
+      $cwdHint.textContent = '프로젝트 없음';
+      $cwdHint.title = '';
+      return;
+    }
+    const displayName = _cwdDisplayName(displayPath);
+    $cwdPath.textContent = displayName;
+    $cwdPath.title = displayPath;
+    $cwdHint.textContent = displayName;
+    $cwdHint.title = displayPath;
   }
 
   function shortenPath(p) {
-    // C:\Users\Name\... → ~\...
-    const home = currentCwd.includes('\\') ? '' : '';
-    const parts = p.replace(/\//g, '\\').split('\\');
+    const value = String(p || '').replace(/\//g, '\\');
+    const parts = value.split('\\');
     if (parts.length > 3) return parts[0] + '\\..\\' + parts.slice(-2).join('\\');
-    return p;
+    return value || '~';
   }
 
   async function selectCwd() {
-    const result = await window.electronAPI.cwd.select();
-    if (result.success) {
-      currentCwd = result.cwd;
-      localStorage.setItem('lastCwd', currentCwd);
-      // 현재 대화에 폴더 저장
-      const conv = getActiveConversation();
-      if (conv) {
-        conv.cwd = currentCwd;
-        saveConversations();
-      }
-      updateCwdDisplay();
-    }
+    await openProjectPicker();
   }
 
   document.getElementById('btn-cwd').addEventListener('click', selectCwd);
@@ -3601,14 +4040,44 @@
       `;
     }
     const isActive = c.id === activeConvId;
+    const isSubagent = !!c.subagentMeta;
+    const subagents = isSubagent ? [] : getSubagentConversations(c.id);
+    const hasSubagents = subagents.length > 0;
+
+    // 서브에이전트 상태 뱃지
+    const statusBadge = isSubagent
+      ? (() => {
+          const s = c.subagentMeta.status;
+          const cls = s === 'completed' ? 'subagent-done' : s === 'error' ? 'subagent-error' : 'subagent-running';
+          const icon = s === 'completed' ? '✓' : s === 'error' ? '✕' : '⟳';
+          return `<span class="subagent-badge ${cls}" title="${escapeHtml(c.subagentMeta.agentName)}">${icon} ${escapeHtml(c.subagentMeta.agentName)}</span>`;
+        })()
+      : '';
+
+    const subagentBtn = !isSubagent
+      ? `<button class="history-subagent-btn" data-subagent-parent="${c.id}" title="서브에이전트 추가">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+          </svg>
+        </button>`
+      : '';
+
+    const subagentChildrenHtml = hasSubagents
+      ? `<div class="subagent-children">${subagents.map(sub => _renderConvItem(sub)).join('')}</div>`
+      : '';
+
     return `
-      <div class="history-row${isActive ? ' is-active' : ''}">
+      <div class="history-row${isActive ? ' is-active' : ''}${isSubagent ? ' is-subagent' : ''}">
         <button class="history-item${isActive ? ' active' : ''}" data-id="${c.id}">
+          ${statusBadge}
           <span class="history-title-text">${escapeHtml(c.title || '새 대화')}</span>
         </button>
+        ${subagentBtn}
         <button class="history-rename-btn" data-rename-id="${c.id}" title="대화 이름 변경">✎</button>
         <button class="history-delete-btn" data-delete-id="${c.id}" title="이 대화 삭제">✕</button>
       </div>
+      ${subagentChildrenHtml}
     `;
   }
 
@@ -3620,134 +4089,8 @@
     return last || cwdPath;
   }
 
-  function _renderCwdGroup(cwdPath, convs) {
-    const groupKey = cwdPath || '';
-    const isCollapsed = collapsedCwdGroups.has(groupKey);
-    const chevron = isCollapsed ? '▸' : '▾';
-    const displayName = _cwdDisplayName(cwdPath);
-    const header = `
-      <div class="folder-header" data-cwd-toggle="${escapeHtml(groupKey)}">
-        <span class="folder-chevron">${chevron}</span>
-        <svg class="folder-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
-        <span class="folder-name" title="${escapeHtml(cwdPath || '(폴더 없음)')}">${escapeHtml(displayName)}</span>
-        <span class="folder-count">${convs.length}</span>
-      </div>
-    `;
-    const items = isCollapsed ? '' : convs.map(c => _renderConvItem(c)).join('');
-    return `<div class="folder-group">${header}<div class="folder-items">${items}</div></div>`;
-  }
-
   function renderHistory() {
-    // 작업폴더(cwd) 기준 분류
-    const cwdMap = new Map(); // cwdPath → [conv]
-    for (const c of conversations) {
-      const key = c.cwd || '';
-      if (!cwdMap.has(key)) cwdMap.set(key, []);
-      cwdMap.get(key).push(c);
-    }
-
-    let html = '';
-    if (cwdMap.size <= 1) {
-      // 모든 대화가 같은 cwd이면 그냥 플랫 렌더링
-      html = conversations.map(c => _renderConvItem(c)).join('');
-    } else {
-      // 여러 cwd가 있으면 그룹별로 렌더링
-      for (const [cwdPath, convs] of cwdMap) {
-        html += _renderCwdGroup(cwdPath, convs);
-      }
-    }
-
-    $historyList.innerHTML = html;
-
-    // 이벤트 위임: 한 번만 등록하고 이후에는 재등록하지 않음
-    if (!_historyDelegationReady) {
-      _historyDelegationReady = true;
-
-      $historyList.addEventListener('click', (e) => {
-        const target = e.target;
-
-        // 대화 선택
-        const histItem = target.closest('.history-item');
-        if (histItem) { loadConversation(histItem.dataset.id); setSidebarCollapsed(true); return; }
-
-        // 이름 변경 시작
-        const renameBtn = target.closest('.history-rename-btn');
-        if (renameBtn) { e.preventDefault(); e.stopPropagation(); beginRenameConversation(renameBtn.dataset.renameId); return; }
-
-        // 이름 저장
-        const saveBtn = target.closest('.history-rename-save-btn');
-        if (saveBtn) {
-          e.preventDefault(); e.stopPropagation();
-          const id = saveBtn.dataset.renameSaveId;
-          const input = $historyList.querySelector(`.history-rename-input[data-rename-input-id="${id}"]`);
-          commitRenameConversation(id, input?.value || '');
-          return;
-        }
-
-        // 이름 변경 취소
-        const cancelBtn = target.closest('.history-rename-cancel-btn');
-        if (cancelBtn) { e.preventDefault(); e.stopPropagation(); cancelRenameConversation(); return; }
-
-        // 삭제
-        const delBtn = target.closest('.history-delete-btn');
-        if (delBtn) { e.preventDefault(); e.stopPropagation(); deleteConversation(delBtn.dataset.deleteId); return; }
-
-        // 작업폴더 그룹 접기/펼치기 (사이드바 닫힘 방지)
-        const cwdToggle = target.closest('.folder-header[data-cwd-toggle]');
-        if (cwdToggle) {
-          e.preventDefault();
-          e.stopPropagation();
-          const key = cwdToggle.dataset.cwdToggle;
-          if (collapsedCwdGroups.has(key)) collapsedCwdGroups.delete(key);
-          else collapsedCwdGroups.add(key);
-          saveCollapsedCwdGroups();
-          renderHistory();
-          return;
-        }
-      });
-
-      $historyList.addEventListener('keydown', (e) => {
-        const input = e.target.closest('.history-rename-input');
-        if (!input) return;
-        const convId = input.dataset.renameInputId;
-        if (e.key === 'Enter') { e.preventDefault(); commitRenameConversation(convId, input.value); }
-        if (e.key === 'Escape') { e.preventDefault(); cancelRenameConversation(); }
-      });
-
-      // 마우스오버 시 잘린 제목 marquee 스크롤
-      $historyList.addEventListener('mouseenter', (e) => {
-        const item = e.target.closest('.history-item');
-        if (!item) return;
-        const textEl = item.querySelector('.history-title-text');
-        if (!textEl) return;
-        const overflow = textEl.scrollWidth - item.clientWidth;
-        if (overflow > 4) {
-          const dur = Math.max(2, Math.min(overflow / 40, 8));
-          textEl.style.setProperty('--marquee-offset', `-${overflow + 20}px`);
-          textEl.style.setProperty('--marquee-duration', `${dur}s`);
-          textEl.classList.add('is-overflowing');
-        }
-      }, true);
-      $historyList.addEventListener('mouseleave', (e) => {
-        const item = e.target.closest('.history-item');
-        if (!item) return;
-        const textEl = item.querySelector('.history-title-text');
-        if (textEl) {
-          textEl.classList.remove('is-overflowing');
-        }
-      }, true);
-    }
-
-    // 편집 중인 항목의 값 복원
-    if (historyEditingId) {
-      const input = $historyList.querySelector(`.history-rename-input[data-rename-input-id="${historyEditingId}"]`);
-      if (input) {
-        const conv = _convMap.get(historyEditingId);
-        input.value = conv?.title || '';
-      }
-    }
+    renderProjects();
   }
 
   let lastAutoSave = 0;
@@ -3777,6 +4120,7 @@
   let _saveDebounceTimer = null;
   function saveConversations() {
     lastAutoSave = Date.now();
+    syncProjectsFromConversations();
     // 디바운스: 300ms 이내 중복 호출 병합
     if (_saveDebounceTimer) clearTimeout(_saveDebounceTimer);
     _saveDebounceTimer = setTimeout(() => {
@@ -3785,7 +4129,7 @@
         console.error('[save] conversations error:', err);
       });
     }, 300);
-    renderHistory();
+    renderProjects();
   }
 
   // 스트리밍 중 주기적 자동 저장 (5초마다)
@@ -3809,18 +4153,97 @@
     const idx = conversations.findIndex(c => c.id === id);
     if (idx < 0) return;
 
+    // 서브에이전트 자식도 함께 삭제
+    const childIds = conversations.filter(c => c.parentConvId === id).map(c => c.id);
+    for (const childId of childIds) {
+      const childIdx = conversations.findIndex(c => c.id === childId);
+      if (childIdx >= 0) {
+        conversations.splice(childIdx, 1);
+        _convMap.delete(childId);
+        pendingRuntimeResetByConv.delete(childId);
+      }
+    }
+
+    const selectedProjectKey = getProjectPathKey(getSelectedProjectPath());
     pendingRuntimeResetByConv.delete(id);
-    const removingActive = activeConvId === id;
-    conversations.splice(idx, 1);
+    const removingActive = activeConvId === id || childIds.includes(activeConvId);
+    conversations.splice(conversations.findIndex(c => c.id === id), 1);
     _convMap.delete(id);
 
     if (removingActive) {
-      activeConvId = conversations.length > 0 ? conversations[0].id : null;
+      activeConvId = selectedProjectKey
+        ? ((conversations.find(conv => getProjectPathKey(conv?.cwd) === selectedProjectKey) || {}).id || null)
+        : (conversations.length > 0 ? conversations[0].id : null);
     }
     if (historyEditingId === id) historyEditingId = null;
 
     saveConversations();
     renderMessages();
+    syncStreamingUI();
+    updateRuntimeHint();
+  }
+
+  async function deleteProject(projectPath) {
+    const projectKey = getProjectPathKey(projectPath);
+    if (!projectKey) return false;
+
+    const projectConversations = getProjectConversations(projectPath);
+    const streamingConversation = projectConversations.find(conv => convStreams.has(conv.id));
+    if (streamingConversation) {
+      showSlashFeedback('스트리밍 중인 대화가 있어 프로젝트를 삭제할 수 없습니다.', true);
+      return false;
+    }
+
+    const displayName = _cwdDisplayName(projectPath);
+    const confirmed = window.confirm(
+      `프로젝트 "${displayName}"와 연결된 대화 ${projectConversations.length}개를 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`
+    );
+    if (!confirmed) return false;
+
+    const removedConversationIds = new Set(projectConversations.map(conv => conv.id));
+    for (const conv of projectConversations) {
+      pendingRuntimeResetByConv.delete(conv.id);
+    }
+
+    conversations = conversations.filter(conv => !removedConversationIds.has(conv.id));
+    _rebuildConvMap();
+
+    if (historyEditingId && removedConversationIds.has(historyEditingId)) {
+      historyEditingId = null;
+    }
+
+    projectPaths = projectPaths.filter(item => getProjectPathKey(item) !== projectKey);
+    saveProjectPaths();
+    collapsedCwdGroups.delete(projectKey);
+    saveCollapsedCwdGroups();
+
+    const deletedSelectedProject = getProjectPathKey(getSelectedProjectPath()) === projectKey;
+    const deletedActiveConversation = activeConvId ? removedConversationIds.has(activeConvId) : false;
+
+    if (deletedSelectedProject) {
+      selectedProjectCwd = '';
+      currentCwd = '';
+    }
+    if (deletedActiveConversation) {
+      activeConvId = null;
+    }
+
+    saveConversations();
+
+    const fallbackProjectPath = deletedSelectedProject ? (projectPaths[0] || '') : '';
+    if (fallbackProjectPath) {
+      await activateProject(fallbackProjectPath, { syncElectron: true, loadLatestConversation: true });
+    } else {
+      updateCwdDisplay();
+      renderProjects();
+      renderMessages();
+      syncStreamingUI();
+      updateRuntimeHint();
+      $input.focus();
+    }
+
+    showSlashFeedback(`프로젝트를 삭제했습니다: ${displayName}`, false);
+    return true;
   }
 
   function beginRenameConversation(id) {
@@ -3829,7 +4252,7 @@
     historyEditingId = id;
     renderHistory();
     requestAnimationFrame(() => {
-      const input = $historyList.querySelector(`.history-rename-input[data-rename-input-id="${id}"]`);
+      const input = $projectList.querySelector(`.history-rename-input[data-rename-input-id="${id}"]`);
       if (!input) return;
       input.focus();
       input.select();
@@ -3862,16 +4285,28 @@
     saveConversations();
   }
 
-  function newConversation() {
+  function newConversation(projectCwd = '', options = {}) {
+    const targetCwd = String(projectCwd || getSelectedProjectPath() || '').trim();
+    if (!targetCwd && options.allowEmptyCwd !== true) {
+      showSlashFeedback('먼저 새 프로젝트를 열거나 프로젝트 목록에서 프로젝트를 선택하세요.', true);
+      return null;
+    }
     const conv = {
       id: `conv_${Date.now()}`,
       title: '',
       messages: [],
       profileId: activeProfileId,
-      cwd: currentCwd,
+      cwd: targetCwd,
       codexSessionId: null,
       lastCodexApprovalPolicy: '',
     };
+    if (targetCwd) {
+      currentCwd = targetCwd;
+      selectedProjectCwd = targetCwd;
+      rememberProjectPath(targetCwd, { moveToFront: true, preferIncoming: true });
+      localStorage.setItem('lastCwd', targetCwd);
+      updateCwdDisplay();
+    }
     conversations.unshift(conv);
     _convMap.set(conv.id, conv);
     activeConvId = conv.id;
@@ -3880,22 +4315,558 @@
     syncStreamingUI();
     updateRuntimeHint();
     $input.focus();
+    return conv;
   }
 
-  async function loadConversation(id) {
+  // === 서브에이전트 기능 ===
+  let cachedAgentList = null;
+  let cachedAgentListTs = 0;
+
+  function getAgentSearchCwd() {
+    const conv = getActiveConversation();
+    return conv?.cwd || currentCwd || getSelectedProjectPath() || '';
+  }
+
+  async function fetchAgentList() {
+    const cwd = getAgentSearchCwd();
+    if (cachedAgentList && Date.now() - cachedAgentListTs < 30000 && cachedAgentList._cwd === cwd) {
+      return cachedAgentList;
+    }
+    try {
+      const result = await window.electronAPI.codex.listAgents({ cwd });
+      if (result?.success) {
+        result.data._cwd = cwd;
+        cachedAgentList = result.data;
+        cachedAgentListTs = Date.now();
+        return result.data;
+      }
+    } catch { /* ignore */ }
+    return [];
+  }
+
+  async function showAvailableAgents() {
+    const agents = await fetchAgentList();
+    if (!agents || agents.length === 0) {
+      showSlashFeedback(`사용 가능한 에이전트가 없습니다.\n탐색 폴더: ${getAgentSearchCwd()}/.codex/agents/`, true);
+      return;
+    }
+    const lines = agents.map(a => `  ${a.name} — ${a.description} [${a.source}]`).join('\n');
+    showSlashFeedback(`사용 가능한 에이전트 (${agents.length}개):\n${lines}`, false);
+  }
+
+  function showAgentPicker(preselectedAgent = '') {
+    const existing = document.getElementById('agent-picker-modal');
+    if (existing) existing.remove();
+
+    fetchAgentList().then(agents => {
+      if (!agents || agents.length === 0) {
+        showSlashFeedback('사용 가능한 에이전트가 없습니다.', true);
+        return;
+      }
+
+      const modal = document.createElement('div');
+      modal.id = 'agent-picker-modal';
+      modal.className = 'agent-picker-overlay';
+      modal.innerHTML = `
+        <div class="agent-picker-dialog">
+          <div class="agent-picker-header">
+            <span class="agent-picker-title">서브에이전트 생성</span>
+            <button class="agent-picker-close" title="닫기">✕</button>
+          </div>
+          <div class="agent-picker-body">
+            <div class="agent-picker-section">
+              <label class="agent-picker-label">에이전트 선택</label>
+              <div class="agent-picker-list">
+                ${agents.map((a, i) => `
+                  <button class="agent-picker-item${(preselectedAgent && a.name === preselectedAgent) || (!preselectedAgent && i === 0) ? ' selected' : ''}"
+                    data-agent-name="${escapeHtml(a.name)}"
+                    data-agent-idx="${i}">
+                    <span class="agent-picker-item-name">${escapeHtml(a.name)}</span>
+                    <span class="agent-picker-item-desc">${escapeHtml(a.description)}</span>
+                    <span class="agent-picker-item-source">${a.source === 'project' ? '프로젝트' : '글로벌'}</span>
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+            <div class="agent-picker-section">
+              <label class="agent-picker-label">작업 지시 (프롬프트)</label>
+              <textarea class="agent-picker-prompt" rows="3" placeholder="서브에이전트에게 맡길 작업을 입력하세요..."></textarea>
+            </div>
+            <div class="agent-picker-section agent-picker-options">
+              <label class="agent-picker-checkbox-label">
+                <input type="checkbox" class="agent-picker-autoclose" ${subagentAutoClose ? 'checked' : ''} />
+                <span>자동 닫기 — 완료 시 결과를 부모 대화에 합치고 서브에이전트 삭제</span>
+              </label>
+            </div>
+          </div>
+          <div class="agent-picker-footer">
+            <button class="agent-picker-cancel">취소</button>
+            <button class="agent-picker-submit">생성</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(modal);
+
+      const $dialog = modal.querySelector('.agent-picker-dialog');
+      const $promptInput = modal.querySelector('.agent-picker-prompt');
+      let selectedAgentName = preselectedAgent || agents[0]?.name || '';
+
+      // 에이전트 선택
+      modal.querySelector('.agent-picker-list').addEventListener('click', (e) => {
+        const item = e.target.closest('.agent-picker-item');
+        if (!item) return;
+        modal.querySelectorAll('.agent-picker-item').forEach(el => el.classList.remove('selected'));
+        item.classList.add('selected');
+        selectedAgentName = item.dataset.agentName;
+      });
+
+      // 닫기
+      const closeModal = () => modal.remove();
+      modal.querySelector('.agent-picker-close').addEventListener('click', closeModal);
+      modal.querySelector('.agent-picker-cancel').addEventListener('click', closeModal);
+      modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+
+      // 생성
+      modal.querySelector('.agent-picker-submit').addEventListener('click', async () => {
+        const prompt = $promptInput.value.trim();
+        if (!prompt) {
+          $promptInput.classList.add('error');
+          $promptInput.focus();
+          setTimeout(() => $promptInput.classList.remove('error'), 1500);
+          return;
+        }
+        const autoClose = modal.querySelector('.agent-picker-autoclose')?.checked ?? false;
+        closeModal();
+        await spawnSubagentByName(selectedAgentName, prompt, { autoClose });
+      });
+
+      // Esc 닫기
+      modal.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeModal();
+        if (e.key === 'Enter' && e.ctrlKey) {
+          e.preventDefault();
+          modal.querySelector('.agent-picker-submit').click();
+        }
+      });
+
+      $promptInput.focus();
+    });
+  }
+
+  async function spawnSubagentByName(agentName, prompt, options = {}) {
+    const agents = await fetchAgentList();
+    const agent = agents.find(a => a.name.toLowerCase() === agentName.toLowerCase());
+    if (!agent) {
+      showSlashFeedback(`에이전트 '${agentName}'를 찾을 수 없습니다. /agents 로 목록을 확인하세요.`, true);
+      return;
+    }
+    await spawnSubagent(agent, prompt, options);
+  }
+
+  async function spawnSubagent(agent, prompt, options = {}) {
+    const autoClose = options.autoClose ?? false;
+    const parentConv = getActiveConversation();
+    const parentId = parentConv?.id || null;
+    const targetCwd = currentCwd || getSelectedProjectPath() || '';
+
+    if (!targetCwd) {
+      showSlashFeedback('프로젝트를 먼저 선택하세요.', true);
+      return;
+    }
+
+    // 서브에이전트용 대화 생성
+    const subConv = {
+      id: `conv_${Date.now()}_sub_${Math.random().toString(16).slice(2, 6)}`,
+      title: `[${agent.name}] ${prompt.slice(0, 40)}${prompt.length > 40 ? '...' : ''}`,
+      messages: [],
+      profileId: activeProfileId,
+      cwd: targetCwd,
+      codexSessionId: null,
+      lastCodexApprovalPolicy: '',
+      parentConvId: parentId,
+      subagentMeta: {
+        agentName: agent.name,
+        description: agent.description,
+        status: 'running',
+      },
+    };
+
+    conversations.unshift(subConv);
+    _convMap.set(subConv.id, subConv);
+    saveConversations();
+    renderHistory();
+
+    showSlashFeedback(`서브에이전트 '${agent.name}' 생성됨: ${prompt.slice(0, 50)}`, false);
+
+    // 서브에이전트 프롬프트: developer_instructions + 사용자 프롬프트
+    const systemPrefix = agent.developer_instructions
+      ? `[시스템 지시 — 에이전트: ${agent.name}]\n${agent.developer_instructions}\n\n[사용자 요청]\n`
+      : '';
+    const fullPrompt = systemPrefix + prompt;
+
+    // 사용자 메시지 추가
+    const userMsg = {
+      id: `msg_${Date.now()}`,
+      role: 'user',
+      content: prompt,
+      profileId: activeProfileId,
+      timestamp: Date.now(),
+    };
+    subConv.messages.push(userMsg);
+
+    // AI 응답 플레이스홀더
+    const aiMsg = {
+      id: `msg_${Date.now() + 1}`,
+      role: 'ai',
+      content: '',
+      profileId: activeProfileId,
+      timestamp: Date.now(),
+    };
+    subConv.messages.push(aiMsg);
+
+    const streamId = aiMsg.id;
+    const profile = PROFILES.find(p => p.id === activeProfileId);
+    let fullOutput = '';
+
+    aiMsg.content = '';
+    aiMsg._subagentStreaming = true;
+
+    // 서브에이전트 스트리밍 진행 상태
+    const subPreviewState = createStreamingPreviewState(19);
+    const startTime = Date.now();
+
+    // 서브에이전트 대화를 보고 있으면 thinking-log 갱신
+    function renderSubagentProgress() {
+      if (activeConvId !== subConv.id) return;
+      const aiEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`);
+      if (!aiEl) return;
+      const logEl = aiEl.querySelector('.thinking-log');
+      renderThinkingLogLines(logEl, subPreviewState.lines);
+      // 경과 시간
+      const elapsedEl = aiEl.querySelector('.thinking-elapsed');
+      if (elapsedEl) {
+        const sec = Math.floor((Date.now() - startTime) / 1000);
+        elapsedEl.textContent = sec < 60 ? `${sec}초` : `${Math.floor(sec / 60)}분 ${sec % 60}초`;
+      }
+      scrollToBottom();
+    }
+
+    const subProgressTimer = setInterval(renderSubagentProgress, 1000);
+
+    // 스트림 핸들러
+    const unsubStream = window.electronAPI.cli.onStream(({ id, chunk, type }) => {
+      if (id !== streamId) return;
+      if (type === 'status' || type === 'progress') {
+        if (type === 'progress') {
+          const normalized = normalizeDetailLine(String(chunk || ''));
+          if (normalized) pushStreamingPreviewLine(subPreviewState, normalized);
+        }
+        renderSubagentProgress();
+        return;
+      }
+      fullOutput += String(chunk || '');
+      // 청크에서 진행 상태 추출
+      updateStreamingPreviewFromChunk(subPreviewState, String(chunk || ''));
+      renderSubagentProgress();
+    });
+
+    const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
+      if (id !== streamId) return;
+      unsubStream();
+      unsubDone();
+      unsubError();
+      clearInterval(subProgressTimer);
+      aiMsg._subagentStreaming = false;
+
+      // Codex 출력을 파싱하여 response 섹션만 저장
+      const sections = parseCodexOutput(fullOutput);
+      const parsed = sections?.response?.content || '';
+      aiMsg.content = parsed || fullOutput;
+
+      subConv.subagentMeta.status = (code === 0 || code === null) ? 'completed' : 'error';
+
+      // 세션 ID 캡처
+      const sidMatch = fullOutput.match(/session[_\s]*(?:id)?[:\s]*([a-f0-9-]{8,})/i);
+      if (sidMatch) subConv.codexSessionId = sidMatch[1];
+
+      saveConversations();
+
+      // 자동 닫기: 결과를 부모 대화에 합치고 서브에이전트 삭제
+      if (autoClose && parentId) {
+        const parent = _convMap.get(parentId);
+        if (parent) {
+          parent.messages.push({
+            id: `msg_${Date.now()}_agent`,
+            role: 'ai',
+            content: `**[${agent.name}]** 결과:\n\n${aiMsg.content}`,
+            profileId: activeProfileId,
+            timestamp: Date.now(),
+          });
+          // 서브에이전트 대화 삭제
+          const idx = conversations.findIndex(c => c.id === subConv.id);
+          if (idx >= 0) conversations.splice(idx, 1);
+          _convMap.delete(subConv.id);
+          // 현재 서브에이전트 보고 있었으면 부모로 전환
+          if (activeConvId === subConv.id) {
+            activeConvId = parentId;
+            renderMessages();
+          }
+          saveConversations();
+          renderHistory();
+          return;
+        }
+      }
+
+      renderHistory();
+      if (activeConvId === subConv.id) { renderMessages(); scrollToBottom({ force: true }); }
+    });
+
+    const unsubError = window.electronAPI.cli.onError(({ id, error }) => {
+      if (id !== streamId) return;
+      unsubStream();
+      unsubDone();
+      unsubError();
+      clearInterval(subProgressTimer);
+      aiMsg._subagentStreaming = false;
+      aiMsg.content = fullOutput || `오류: ${error}`;
+      aiMsg.role = 'error';
+      subConv.subagentMeta.status = 'error';
+      saveConversations();
+      renderHistory();
+      if (activeConvId === subConv.id) { renderMessages(); scrollToBottom({ force: true }); }
+    });
+
+    // 서브에이전트 실행 args 구성
+    const subArgs = buildCodexArgs(null);
+
+    try {
+      const runResult = await window.electronAPI.cli.run({
+        id: streamId,
+        profile: {
+          command: profile.command,
+          args: subArgs,
+          mode: 'pipe',
+          env: {},
+        },
+        prompt: fullPrompt,
+        cwd: targetCwd,
+      });
+
+      if (!runResult?.success) {
+        aiMsg.content = `서브에이전트 실행 실패: ${runResult?.error || 'unknown error'}`;
+        aiMsg.role = 'error';
+        subConv.subagentMeta.status = 'error';
+        saveConversations();
+        renderHistory();
+      }
+    } catch (err) {
+      aiMsg.content = `서브에이전트 실행 오류: ${err?.message || String(err)}`;
+      aiMsg.role = 'error';
+      subConv.subagentMeta.status = 'error';
+      saveConversations();
+      renderHistory();
+    }
+  }
+
+  // === 방식 1: Codex 출력에서 spawn_agent 감지 → 독립 프로세스로 재실행 ===
+  // Codex가 내부 서브에이전트를 쓰면 개별 작업 과정이 안 보이므로,
+  // spawn_agent 프롬프트를 가로채서 우리 spawnSubagent()로 독립 실행한다.
+  const codexAgentTracker = {
+    spawnedPrompts: new Set(), // 중복 방지
+  };
+
+  function detectCodexAgentActivity(chunk, convId) {
+    const text = String(chunk || '');
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('{')) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        const type = String(obj.type || '').toLowerCase();
+        const item = obj.item || {};
+        const itemType = String(item.type || '').toLowerCase();
+        const tool = String(item.tool || '').toLowerCase();
+
+        // thread.started 이벤트에서 닉네임 캐시
+        if (type === 'thread.started' || type === 'thread.created') {
+          const tid = obj.thread_id || obj.id || '';
+          const nick = obj.nickname || obj.display_name || obj.name || '';
+          if (tid && nick) {
+            codexAgentTracker._threadNicknames = codexAgentTracker._threadNicknames || {};
+            codexAgentTracker._threadNicknames[tid] = nick;
+          }
+        }
+
+        // spawn_agent 감지 → 독립 프로세스로 실행
+        if (itemType === 'collab_tool_call' && tool === 'spawn_agent' && type === 'item.started') {
+          const prompt = String(item.prompt || '').trim();
+          if (!prompt || codexAgentTracker.spawnedPrompts.has(prompt)) continue;
+          codexAgentTracker.spawnedPrompts.add(prompt);
+
+          // 프롬프트에서 에이전트 이름 + 작업 요약 추출
+          const agentNum = codexAgentTracker.spawnedPrompts.size;
+          let agentName = `서브에이전트 ${agentNum}`;
+          let taskSummary = '';
+
+          // 1순위: Codex가 부여한 닉네임/이름 필드
+          const codexName = item.nickname || item.agent_name || item.name || item.display_name || '';
+          if (codexName) {
+            agentName = String(codexName).trim().slice(0, 30);
+          }
+          // 2순위: "You are Agent 1." or "You are the code_explorer." 패턴
+          else {
+            const nameMatch = prompt.match(/You are\s+(?:the\s+)?(.+?)[\.\n]/i);
+            if (nameMatch) {
+              agentName = nameMatch[1].trim().slice(0, 30);
+            } else {
+              // 3순위: 작업 대상에서 이름 생성
+              const targetMatch = prompt.match(/(?:of|for|in)\s+[`"']?([^`"'\s.]+(?:\.[a-z]+)?)[`"']?/i);
+              if (targetMatch) {
+                agentName = `Agent: ${targetMatch[1]}`;
+              }
+            }
+          }
+
+          // 작업 내용 추출: 첫 번째 문장 이후의 핵심 동사구
+          const taskMatch = prompt.match(/(?:Analyze|Review|Check|Examine|Investigate|Find|Search|Look|Read|분석|검토|확인|조사)\s+(.+?)(?:\.|$)/i);
+          if (taskMatch) {
+            taskSummary = taskMatch[0].trim().slice(0, 50);
+          }
+
+          // 독립 codex exec 프로세스로 실행 (작업 과정 실시간 표시)
+          const fakeAgent = {
+            name: agentName,
+            description: taskSummary || `Codex가 위임한 작업 #${agentNum}`,
+            developer_instructions: '',
+          };
+          spawnSubagent(fakeAgent, prompt, { autoClose: subagentAutoClose });
+        }
+      } catch { /* not JSON */ }
+    }
+  }
+
+  // === 방식 2: 프롬프트 분석 → 자동 서브에이전트 스폰 ===
+  async function autoSpawnSubagents(userPrompt) {
+    const agents = await fetchAgentList();
+    if (!agents || agents.length === 0) {
+      showSlashFeedback('사용 가능한 에이전트가 없어 자동 분배할 수 없습니다.', true);
+      return;
+    }
+
+    const targetCwd = currentCwd || getSelectedProjectPath() || '';
+    if (!targetCwd) {
+      showSlashFeedback('프로젝트를 먼저 선택하세요.', true);
+      return;
+    }
+
+    showSlashFeedback('작업을 분석하고 서브에이전트를 자동 배정 중...', false);
+
+    // Codex에게 작업 분해를 요청
+    const agentNames = agents.map(a => `${a.name}: ${a.description}`).join('\n');
+    const planPrompt = `다음 작업을 분석하여, 사용 가능한 에이전트들에게 병렬로 할당할 작업 목록을 JSON 배열로만 응답하세요.
+다른 설명 없이 JSON만 출력하세요.
+
+사용 가능한 에이전트:
+${agentNames}
+
+사용자 요청:
+${userPrompt}
+
+응답 형식 (JSON 배열만):
+[{"agent": "에이전트명", "task": "구체적 작업 지시"}]`;
+
+    const profile = PROFILES.find(p => p.id === activeProfileId);
+    const planStreamId = `plan_${Date.now()}`;
+    let planOutput = '';
+
+    return new Promise((resolve) => {
+      const unsubStream = window.electronAPI.cli.onStream(({ id, chunk, type }) => {
+        if (id !== planStreamId) return;
+        if (type === 'status' || type === 'progress') return;
+        planOutput += String(chunk || '');
+      });
+
+      const unsubDone = window.electronAPI.cli.onDone(async ({ id, code }) => {
+        if (id !== planStreamId) return;
+        unsubStream();
+        unsubDone();
+        unsubError();
+
+        // 응답에서 JSON 추출
+        const sections = parseCodexOutput(planOutput);
+        const responseText = sections?.response?.content || planOutput;
+        const jsonMatch = responseText.match(/\[[\s\S]*?\]/);
+        if (!jsonMatch) {
+          showSlashFeedback('작업 분해 실패: 응답에서 JSON을 추출할 수 없습니다.', true);
+          resolve();
+          return;
+        }
+
+        try {
+          const tasks = JSON.parse(jsonMatch[0]);
+          if (!Array.isArray(tasks) || tasks.length === 0) {
+            showSlashFeedback('분해된 작업이 없습니다.', true);
+            resolve();
+            return;
+          }
+
+          showSlashFeedback(`${tasks.length}개 서브에이전트를 자동 생성합니다...`, false);
+
+          // 각 태스크에 대해 서브에이전트 스폰 (병렬)
+          const spawnPromises = tasks.map(t => {
+            const agentName = String(t.agent || '').trim();
+            const task = String(t.task || '').trim();
+            if (!agentName || !task) return Promise.resolve();
+            return spawnSubagentByName(agentName, task, { autoClose: true });
+          });
+
+          await Promise.all(spawnPromises);
+          showSlashFeedback(`${tasks.length}개 서브에이전트가 작업을 시작했습니다.`, false);
+        } catch (err) {
+          showSlashFeedback(`작업 분해 JSON 파싱 실패: ${err.message}`, true);
+        }
+        resolve();
+      });
+
+      const unsubError = window.electronAPI.cli.onError(({ id }) => {
+        if (id !== planStreamId) return;
+        unsubStream();
+        unsubDone();
+        unsubError();
+        showSlashFeedback('작업 분해 중 오류가 발생했습니다.', true);
+        resolve();
+      });
+
+      window.electronAPI.cli.run({
+        id: planStreamId,
+        profile: {
+          command: profile.command,
+          args: buildCodexArgs(null),
+          mode: 'pipe',
+          env: {},
+        },
+        prompt: planPrompt,
+        cwd: targetCwd,
+      });
+    });
+  }
+
+  async function loadConversation(id, options = {}) {
     try {
       activeConvId = id;
       const conv = getActiveConversation();
       // 대화별 실행 모드 복원
       // 대화별 작업 폴더 복원
       if (conv && conv.cwd) {
-        const result = await window.electronAPI.cwd.set(conv.cwd);
-        if (result.success) {
-          currentCwd = conv.cwd;
-          updateCwdDisplay();
-        }
+        await setProjectContext(conv.cwd, {
+          syncElectron: options.skipProjectSync !== true,
+          allowInvalidPath: true,
+          moveProjectToFront: true,
+          render: false,
+        });
       }
       renderMessages();
+      renderProjects();
       renderHistory();
       syncStreamingUI();
       updateRuntimeHint();
@@ -3905,6 +4876,7 @@
       // 깨진 대화 데이터가 있어도 앱 전체 입력/클릭이 멈추지 않도록 복구
       activeConvId = null;
       renderMessages();
+      renderProjects();
       renderHistory();
       syncStreamingUI();
       $input.focus();
@@ -8074,6 +9046,18 @@
   }
 
   function renderAIBody(msg, opts = {}) {
+    // 서브에이전트 스트리밍 중이면 작업 표시기 + thinking-log 반환
+    if (msg._subagentStreaming) {
+      return `<div class="thinking-indicator">
+        <div class="thinking-header">
+          <div class="thinking-dots"><span></span><span></span><span></span></div>
+          <span class="thinking-text">서브에이전트 작업 중...</span>
+          <span class="thinking-elapsed">0초</span>
+        </div>
+        <div class="thinking-log"></div>
+      </div>`;
+    }
+
     // 렌더링 캐시: 동일 content + activeTab 조합이면 이전 HTML 재사용
     const cacheKey = msg.content + '|' + (opts?.activeTab || 'answer');
     const cached = getCachedRender(cacheKey);
@@ -8446,6 +9430,9 @@
       aiMsg.content = fullOutput;
       applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
+
+      // Codex 내부 에이전트 활동 감지 (방식 1)
+      detectCodexAgentActivity(chunk, convId);
 
       // 승인 요청 감지 (runCodexWithExtraArgs)
       if (approvalPolicy !== 'auto-approve') {
@@ -8992,6 +9979,9 @@
       streamState.currentAiMsg.content = fullOutput;
       applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
+
+      // Codex 내부 에이전트 활동 감지 (방식 1)
+      detectCodexAgentActivity(chunk, convId);
 
       // 승인 요청 감지
       if (approvalPolicy !== 'auto-approve') {
@@ -9602,9 +10592,9 @@
     $input.style.height = Math.min($input.scrollHeight, 150) + 'px';
   }
 
-  // 새 대화
-  document.getElementById('btn-new-chat').addEventListener('click', () => {
-    newConversation();
+  // 새 프로젝트
+  document.getElementById('btn-open-project').addEventListener('click', async () => {
+    await openProjectPicker();
   });
 
   // 기록 삭제
@@ -9656,7 +10646,11 @@
   document.addEventListener('keydown', (e) => {
     if (e.ctrlKey && e.key === 'n') {
       e.preventDefault();
-      newConversation();
+      if (getSelectedProjectPath()) {
+        newConversation(getSelectedProjectPath());
+      } else {
+        void openProjectPicker();
+      }
     }
     if (e.ctrlKey && e.key.toLowerCase() === 'b') {
       e.preventDefault();

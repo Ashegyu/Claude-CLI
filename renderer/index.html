@@ -35,9 +35,13 @@
     <!-- 사이드바 -->
     <aside id="sidebar">
       <div id="sidebar-top">
-        <button id="btn-new-chat" class="sidebar-btn primary-btn">
-          <svg width="15" height="15" viewBox="0 0 15 15"><line x1="7.5" y1="2" x2="7.5" y2="13" stroke="currentColor" stroke-width="1.6"/><line x1="2" y1="7.5" x2="13" y2="7.5" stroke="currentColor" stroke-width="1.6"/></svg>
-          새 대화
+        <button id="btn-open-project" class="sidebar-btn primary-btn">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            <line x1="12" y1="10" x2="12" y2="18"/>
+            <line x1="8" y1="14" x2="16" y2="14"/>
+          </svg>
+          새 프로젝트
         </button>
       </div>
 
@@ -47,21 +51,21 @@
         <div id="profile-list"></div>
       </div>
 
-      <!-- 작업 폴더 -->
+      <!-- 프로젝트 목록 -->
+      <div id="project-section">
+        <div class="section-label">프로젝트 목록</div>
+        <div id="project-list"></div>
+      </div>
+
+      <!-- 현재 프로젝트 -->
       <div id="cwd-section">
-        <div class="section-label">작업 폴더</div>
-        <button id="btn-cwd" class="cwd-btn" title="폴더 변경 (클릭)">
+        <div class="section-label">선택된 프로젝트</div>
+        <button id="btn-cwd" class="cwd-btn" title="프로젝트 열기/변경">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
           </svg>
-          <span id="cwd-path">~</span>
+          <span id="cwd-path">프로젝트를 선택하세요</span>
         </button>
-      </div>
-
-      <!-- 대화 히스토리 -->
-      <div id="history-section">
-        <div class="section-label">최근 대화</div>
-        <div id="history-list"></div>
       </div>
 
       <!-- 사이드바 하단 -->
@@ -138,6 +142,8 @@
           <button id="context-compress-hint" class="runtime-hint runtime-select-btn" type="button" title="컨텍스트 압축 설정"></button>
           <span class="sep">·</span>
           <span>Enter 전송 · Shift+Enter 줄바꿈 · @파일경로 불러오기 · / 명령어 목록</span>
+          <span class="sep">·</span>
+          <button id="btn-subagent-autoclose" class="runtime-hint runtime-select-btn subagent-autoclose-btn" type="button" title="서브에이전트 완료 시 자동 닫기 설정">에이전트: 유지</button>
         </div>
         <div id="runtime-selector-menu" class="hidden" role="listbox" aria-label="런타임 설정 선택"></div>
         <div id="codex-statusbar" aria-live="polite"></div>
