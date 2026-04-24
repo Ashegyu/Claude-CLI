@@ -886,6 +886,7 @@
     { command: '/reasoning', description: 'Reasoning effort 변경', usage: '/reasoning [low|medium|high|extra high]' },
     { command: '/models', description: 'Codex CLI 모델 목록 새로고침/표시', usage: '/models' },
     { command: '/commands', description: 'Codex CLI 명령어 목록 새로고침/표시', usage: '/commands' },
+    { command: '/skills', description: 'Codex 스킬 목록 새로고침/표시', usage: '/skills' },
     { command: '/settings', description: 'Codex config.toml 설정', usage: '/settings' },
     { command: '/sandbox', description: '샌드박스 모드 변경', usage: '/sandbox [read-only|workspace-write|danger-full-access]' },
     { command: '/cwd', description: '작업 폴더 변경', usage: '/cwd [경로]' },
@@ -907,6 +908,9 @@
   let codexCommandOptions = [];
   let codexCommandCatalogSource = 'none';
   let codexCommandCatalogCwd = '';
+  let codexSkillOptions = [];
+  let codexSkillCatalogSource = 'none';
+  let codexSkillCatalogCwd = '';
   // 기본 모델 목록 (드롭다운 빠른 선택용) + 커스텀 입력 지원
   const FALLBACK_MODEL_OPTIONS = [
     { id: 'gpt-5.4', cliModel: 'gpt-5.4', label: 'gpt-5.4', source: 'fallback' },
@@ -1924,6 +1928,13 @@
       source: 'codex',
       codexName: item.name,
     }));
+    codexSkillOptions.forEach((item) => append({
+      command: item.command,
+      description: `${item.scope === 'project' ? '프로젝트 스킬' : '사용자 스킬'}: ${item.description}`,
+      usage: item.usage,
+      source: 'skill',
+      skillSlug: item.slug,
+    }));
     return merged;
   }
 
@@ -1931,6 +1942,82 @@
     const normalized = String(command || '').trim().replace(/^\//, '').toLowerCase();
     if (!normalized) return null;
     return codexCommandOptions.find(item => item.name === normalized) || null;
+  }
+
+  function normalizeSkillSlug(name) {
+    return String(name || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_.:-]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  function normalizeCodexSkillOption(rawSkill) {
+    const name = String(rawSkill?.name || '').trim();
+    if (!name) return null;
+    const slug = normalizeSkillSlug(name);
+    if (!slug) return null;
+    const scope = String(rawSkill?.scope || 'user').trim().toLowerCase() === 'project' ? 'project' : 'user';
+    return {
+      name,
+      slug,
+      command: `/skill:${slug}`,
+      description: String(rawSkill?.description || 'Codex 스킬').trim(),
+      scope,
+      path: String(rawSkill?.path || '').trim(),
+      usage: `/skill:${slug} [요청]`,
+      source: 'skill',
+    };
+  }
+
+  function setCodexSkillOptionsFromCatalog(skills, source, cwd) {
+    const normalized = [];
+    const seen = new Set();
+    for (const item of Array.isArray(skills) ? skills : []) {
+      const skill = normalizeCodexSkillOption(item);
+      if (!skill) continue;
+      const key = `${skill.scope}:${skill.slug}:${skill.path.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      normalized.push(skill);
+    }
+    codexSkillOptions = normalized;
+    codexSkillCatalogSource = source || 'codex-skills';
+    codexSkillCatalogCwd = cwd || currentCwd || '';
+    if (isSlashMenuOpen()) updateSlashCommandMenu();
+    return normalized.length > 0;
+  }
+
+  async function refreshCodexSkillOptions(cwd = currentCwd) {
+    if (!window.electronAPI?.codex?.listSkills) return false;
+    try {
+      const result = await window.electronAPI.codex.listSkills({ cwd: cwd || currentCwd || '' });
+      if (!result?.success || !Array.isArray(result.skills)) return false;
+      return setCodexSkillOptionsFromCatalog(result.skills, result.source || 'codex-skills', result.cwd || cwd);
+    } catch (err) {
+      console.error('[skills] listSkills failed:', err);
+      return false;
+    }
+  }
+
+  async function showCodexSkillList() {
+    const refreshed = await refreshCodexSkillOptions(currentCwd);
+    const lines = codexSkillOptions.map((skill) => {
+      const scope = skill.scope === 'project' ? '프로젝트' : '사용자';
+      const desc = skill.description ? ` - ${skill.description}` : '';
+      return `  ${skill.command} [${scope}]${desc}`;
+    });
+    const cwdLabel = codexSkillCatalogCwd ? `, cwd: ${codexSkillCatalogCwd}` : '';
+    const suffix = refreshed ? '' : '\n새로고침 실패로 현재 캐시 목록을 표시합니다.';
+    const body = lines.length ? lines.join('\n') : '  로드된 Codex 스킬이 없습니다.';
+    showSlashFeedback(`Codex 스킬 (${codexSkillOptions.length}개, ${codexSkillCatalogSource}${cwdLabel}):\n${body}${suffix}`, false);
+  }
+
+  function getDynamicCodexSkill(command) {
+    const normalized = String(command || '').trim().replace(/^\//, '').toLowerCase();
+    if (!normalized.startsWith('skill:')) return null;
+    const slug = normalized.slice('skill:'.length);
+    return codexSkillOptions.find(item => item.slug === slug) || null;
   }
 
   function normalizeModelOptionId(value) {
@@ -3644,6 +3731,11 @@
       return true;
     }
 
+    if (command === '/skills') {
+      await showCodexSkillList();
+      return true;
+    }
+
     if (command === '/settings') {
       await openCodexSettingsModal();
       return true;
@@ -3976,6 +4068,17 @@
       } else {
         showAgentPicker(cleanArg);
       }
+      return true;
+    }
+
+    const dynamicCodexSkill = getDynamicCodexSkill(command);
+    if (dynamicCodexSkill) {
+      if (!argText) {
+        showSlashFeedback(`${dynamicCodexSkill.command} 뒤에 요청을 입력하세요.`, true);
+        return true;
+      }
+      const skillPrompt = `다음 요청은 Codex 스킬 "${dynamicCodexSkill.name}"을 사용해서 처리하세요.\n스킬 경로: ${dynamicCodexSkill.path || '(알 수 없음)'}\n\n사용자 요청:\n${argText}`;
+      await sendMessage(skillPrompt);
       return true;
     }
 
@@ -4446,6 +4549,7 @@
     localStorage.setItem('lastCwd', resolvedPath);
     updateCwdDisplay();
     void refreshCodexCommandOptions(resolvedPath);
+    void refreshCodexSkillOptions(resolvedPath);
 
     if (options.render !== false) {
       renderProjects();
@@ -4515,6 +4619,7 @@
   runInitStep('active-profile', () => setActiveProfile(activeProfileId));
   runInitStep('model-catalog', () => refreshCodexModelOptions());
   runInitStep('command-catalog', () => refreshCodexCommandOptions(currentCwd));
+  runInitStep('skill-catalog', () => refreshCodexSkillOptions(currentCwd));
   runInitStep('statusbar', () => updateCodexStatusbar());
   runInitStep('rate-limits', () => refreshCodexRateLimits('init'));
 

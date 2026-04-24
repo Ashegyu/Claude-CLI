@@ -1479,6 +1479,107 @@ function readCodexConfigFile() {
   };
 }
 
+function parseSkillFrontMatter(raw) {
+  const text = String(raw || '');
+  if (!text.startsWith('---')) return {};
+  const end = text.indexOf('\n---', 3);
+  if (end < 0) return {};
+  const block = text.slice(3, end).trim();
+  const meta = {};
+  for (const line of block.split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.+)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    meta[match[1].trim()] = value;
+  }
+  return meta;
+}
+
+function readSkillFile(skillPath, scope) {
+  const raw = fs.readFileSync(skillPath, 'utf8');
+  const meta = parseSkillFrontMatter(raw);
+  const dir = path.dirname(skillPath);
+  const fallbackName = path.basename(dir);
+  const name = String(meta.name || fallbackName).trim();
+  if (!name) return null;
+  return {
+    name,
+    description: String(meta.description || '').trim(),
+    scope,
+    path: skillPath,
+  };
+}
+
+function collectSkillFiles(rootDir, scope) {
+  const skills = [];
+  const root = path.resolve(rootDir);
+  if (!fs.existsSync(root)) return skills;
+  const maxDepth = 5;
+  const stack = [{ dir: root, depth: 0 }];
+  const seenDirs = new Set();
+
+  while (stack.length > 0) {
+    const item = stack.pop();
+    if (!item || seenDirs.has(item.dir) || item.depth > maxDepth) continue;
+    seenDirs.add(item.dir);
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(item.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    const skillFile = entries.find(entry => entry.isFile() && entry.name.toLowerCase() === 'skill.md');
+    if (skillFile) {
+      try {
+        const skill = readSkillFile(path.join(item.dir, skillFile.name), scope);
+        if (skill) skills.push(skill);
+      } catch {
+        // Ignore unreadable skill files.
+      }
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name === 'node_modules' || entry.name === '.git') continue;
+      stack.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
+    }
+  }
+
+  return skills;
+}
+
+function listCodexSkills(cwd) {
+  const runCwd = resolveExistingDirectory(cwd, workingDirectory);
+  const candidates = [
+    { root: path.join(os.homedir(), '.codex', 'skills'), scope: 'user' },
+    { root: path.join(runCwd, '.codex', 'skills'), scope: 'project' },
+    { root: path.join(runCwd, '.agents', 'skills'), scope: 'project' },
+  ];
+  const merged = [];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    for (const skill of collectSkillFiles(candidate.root, candidate.scope)) {
+      const key = `${skill.scope}:${skill.name.toLowerCase()}:${skill.path.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(skill);
+    }
+  }
+
+  merged.sort((a, b) => {
+    if (a.scope !== b.scope) return a.scope === 'project' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return { cwd: runCwd, skills: merged };
+}
+
 // --- CLI 실행 (node-pty 기반 PTY) ---
 ipcMain.handle('cli:run', (event, request = {}) => {
   const { id, profile = {}, prompt, cwd } = request || {};
@@ -2691,6 +2792,27 @@ ipcMain.handle('codex:listCommands', async (event, arg = {}) => {
       cwd: resolveExistingDirectory(arg?.cwd, workingDirectory),
       error: err.message || String(err),
       commands: [],
+    };
+  }
+});
+
+ipcMain.handle('codex:listSkills', (event, arg = {}) => {
+  try {
+    const cwd = typeof arg?.cwd === 'string' ? arg.cwd : workingDirectory;
+    const result = listCodexSkills(cwd);
+    return {
+      success: true,
+      source: 'codex-skills',
+      cwd: result.cwd,
+      skills: result.skills,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      source: 'codex-skills',
+      cwd: resolveExistingDirectory(arg?.cwd, workingDirectory),
+      error: err.message || String(err),
+      skills: [],
     };
   }
 });
