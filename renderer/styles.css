@@ -1532,6 +1532,7 @@ body.sidebar-resizing * {
 }
 
 #conversation-split {
+  --subagent-rail-width: clamp(340px, 28vw, 430px);
   flex: 1;
   min-height: 0;
   display: grid;
@@ -1540,7 +1541,63 @@ body.sidebar-resizing * {
 }
 
 #conversation-split.has-subagents {
-  grid-template-columns: minmax(0, 1fr) clamp(340px, 28vw, 430px);
+  grid-template-columns: minmax(0, 1fr) 10px var(--subagent-rail-width);
+}
+
+#subagent-rail-resizer {
+  display: none;
+  min-height: 0;
+  cursor: col-resize;
+  position: relative;
+  touch-action: none;
+  user-select: none;
+}
+
+#conversation-split.has-subagents #subagent-rail-resizer {
+  display: block;
+}
+
+#subagent-rail-resizer::before {
+  content: '';
+  position: absolute;
+  top: 34px;
+  bottom: 28px;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: rgba(168, 85, 247, 0.24);
+}
+
+#subagent-rail-resizer::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 42px;
+  border-radius: 999px;
+  transform: translate(-50%, -50%);
+  background: rgba(168, 85, 247, 0.32);
+  box-shadow: 0 0 18px rgba(168, 85, 247, 0.18);
+  opacity: 0.45;
+  transition: opacity var(--transition), background var(--transition), box-shadow var(--transition);
+}
+
+#subagent-rail-resizer:hover::after,
+body.subagent-rail-resizing #subagent-rail-resizer::after {
+  opacity: 1;
+  background: #c084fc;
+  box-shadow: 0 0 18px rgba(192, 132, 252, 0.5);
+}
+
+body.subagent-rail-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+body.subagent-rail-resizing #messages,
+body.subagent-rail-resizing #subagent-rail {
+  pointer-events: none;
 }
 
 /* ========================================
@@ -1739,6 +1796,9 @@ body.sidebar-resizing * {
   #conversation-split.has-subagents {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(0, 1fr) minmax(220px, 38vh);
+  }
+  #conversation-split.has-subagents #subagent-rail-resizer {
+    display: none;
   }
   #subagent-rail {
     border-left: none;

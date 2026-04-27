@@ -97,7 +97,12 @@
             status: String(item.subagentMeta.status || 'pending'),
           }
         : null;
-      normalized.push({ id, title, messages, profileId, cwd, codexSessionId, lastCodexApprovalPolicy, parentConvId, subagentMeta });
+      const normalizedConv = { id, title, messages, profileId, cwd, codexSessionId, lastCodexApprovalPolicy, parentConvId, subagentMeta };
+      const subagentRailWidthPx = Number(item.subagentRailWidthPx);
+      if (Number.isFinite(subagentRailWidthPx) && subagentRailWidthPx > 0) {
+        normalizedConv.subagentRailWidthPx = Math.round(subagentRailWidthPx);
+      }
+      normalized.push(normalizedConv);
     }
     return normalized;
   }
@@ -851,16 +856,23 @@
   const SIDEBAR_MIN_WIDTH = 280;
   const SIDEBAR_MAX_WIDTH = 560;
   const SIDEBAR_AUTO_CLOSE_MS = 7000;
+  const SUBAGENT_RAIL_DEFAULT_WIDTH = 400;
+  const SUBAGENT_RAIL_MIN_WIDTH = 320;
+  const SUBAGENT_RAIL_MAX_WIDTH = 640;
+  const SUBAGENT_RAIL_MIN_MAIN_WIDTH = 620;
   let sidebarWidthPx = null;
   let sidebarCollapsed = false;
   let sidebarResizeSession = null;
   let sidebarTemporaryOpen = false;
   let sidebarAutoCloseTimer = null;
+  let subagentRailWidthPx = null;
+  let subagentRailResizeSession = null;
 
   // === DOM ===
   const $messages = document.getElementById('messages');
   const $conversationSplit = document.getElementById('conversation-split');
   const $subagentRail = document.getElementById('subagent-rail');
+  const $subagentRailResizer = document.getElementById('subagent-rail-resizer');
   const $sidebar = document.getElementById('sidebar');
   const $sidebarResizer = document.getElementById('sidebar-resizer');
   const $welcome = document.getElementById('welcome');
@@ -4247,6 +4259,108 @@
     saveSidebarPrefs();
   }
 
+  function clampSubagentRailWidth(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return SUBAGENT_RAIL_DEFAULT_WIDTH;
+    const splitWidth = Number($conversationSplit?.clientWidth) || window.innerWidth || 0;
+    const maxByViewport = splitWidth > 0
+      ? Math.max(SUBAGENT_RAIL_MIN_WIDTH, splitWidth - SUBAGENT_RAIL_MIN_MAIN_WIDTH)
+      : SUBAGENT_RAIL_MAX_WIDTH;
+    const maxWidth = Math.min(SUBAGENT_RAIL_MAX_WIDTH, maxByViewport);
+    const minWidth = Math.min(SUBAGENT_RAIL_MIN_WIDTH, maxWidth);
+    return Math.round(Math.min(maxWidth, Math.max(minWidth, numeric)));
+  }
+
+  function applySubagentRailWidth() {
+    if (!$conversationSplit) return;
+    const width = clampSubagentRailWidth(
+      Number.isFinite(subagentRailWidthPx) ? subagentRailWidthPx : SUBAGENT_RAIL_DEFAULT_WIDTH
+    );
+    subagentRailWidthPx = width;
+    $conversationSplit.style.setProperty('--subagent-rail-width', `${width}px`);
+  }
+
+  function syncSubagentRailWidthFromConversation(conv = getActiveConversation()) {
+    const storedWidth = Number(conv?.subagentRailWidthPx);
+    subagentRailWidthPx = Number.isFinite(storedWidth) && storedWidth > 0
+      ? storedWidth
+      : SUBAGENT_RAIL_DEFAULT_WIDTH;
+    applySubagentRailWidth();
+  }
+
+  function saveSubagentRailWidth(conv = getActiveConversation()) {
+    if (!conv || !Number.isFinite(subagentRailWidthPx)) return;
+    const width = clampSubagentRailWidth(subagentRailWidthPx);
+    if (conv.subagentRailWidthPx === width) return;
+    conv.subagentRailWidthPx = width;
+    subagentRailWidthPx = width;
+    applySubagentRailWidth();
+    saveConversations();
+  }
+
+  function clearConversationSubagentRailWidth(conv = getActiveConversation()) {
+    if (conv && Object.prototype.hasOwnProperty.call(conv, 'subagentRailWidthPx')) {
+      delete conv.subagentRailWidthPx;
+      saveConversations();
+    }
+  }
+
+  function beginSubagentRailResize(e) {
+    if (!$conversationSplit || !$subagentRail || $subagentRail.classList.contains('hidden')) return;
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    subagentRailResizeSession = {
+      startX: e.clientX,
+      startWidth: $subagentRail.getBoundingClientRect().width || subagentRailWidthPx || SUBAGENT_RAIL_DEFAULT_WIDTH,
+    };
+    document.body.classList.add('subagent-rail-resizing');
+    window.addEventListener('pointermove', onSubagentRailResizeMove);
+    window.addEventListener('pointerup', endSubagentRailResize);
+    window.addEventListener('pointercancel', endSubagentRailResize);
+  }
+
+  function onSubagentRailResizeMove(e) {
+    if (!subagentRailResizeSession) return;
+    const delta = e.clientX - subagentRailResizeSession.startX;
+    subagentRailWidthPx = clampSubagentRailWidth(subagentRailResizeSession.startWidth - delta);
+    applySubagentRailWidth();
+  }
+
+  function endSubagentRailResize() {
+    if (!subagentRailResizeSession) return;
+    subagentRailResizeSession = null;
+    document.body.classList.remove('subagent-rail-resizing');
+    window.removeEventListener('pointermove', onSubagentRailResizeMove);
+    window.removeEventListener('pointerup', endSubagentRailResize);
+    window.removeEventListener('pointercancel', endSubagentRailResize);
+    saveSubagentRailWidth();
+  }
+
+  function resetSubagentRailWidth() {
+    subagentRailWidthPx = SUBAGENT_RAIL_DEFAULT_WIDTH;
+    applySubagentRailWidth();
+    clearConversationSubagentRailWidth();
+  }
+
+  function initSubagentRailLayout() {
+    syncSubagentRailWidthFromConversation();
+    if ($subagentRailResizer) {
+      $subagentRailResizer.addEventListener('pointerdown', beginSubagentRailResize);
+      $subagentRailResizer.addEventListener('dblclick', resetSubagentRailWidth);
+    }
+    window.addEventListener('resize', () => {
+      if (!Number.isFinite(subagentRailWidthPx)) return;
+      const activeConv = getActiveConversation();
+      if (getSubagentPanelMessages(activeConv).length === 0) return;
+      const next = clampSubagentRailWidth(subagentRailWidthPx);
+      if (next !== subagentRailWidthPx) {
+        subagentRailWidthPx = next;
+        applySubagentRailWidth();
+        saveSubagentRailWidth();
+      }
+    });
+  }
+
   function initSidebarLayout() {
     loadSidebarPrefs();
     applySidebarState();
@@ -4692,6 +4806,7 @@
 
   // === 초기화 ===
   runInitStep('sidebar-layout', () => initSidebarLayout());
+  runInitStep('subagent-rail-layout', () => initSubagentRailLayout());
   runInitStep('sidebar-meta', () => initSidebarMeta());
   runInitStep('cwd', () => initCwd());
   runInitStep('profiles', () => renderProfiles());
@@ -5141,6 +5256,7 @@
     conversations.unshift(conv);
     _convMap.set(conv.id, conv);
     activeConvId = conv.id;
+    syncSubagentRailWidthFromConversation(conv);
     saveConversations();
     renderMessages();
     syncStreamingUI();
@@ -5661,6 +5777,7 @@ ${userPrompt}
     try {
       activeConvId = id;
       const conv = getActiveConversation();
+      syncSubagentRailWidthFromConversation(conv);
       // 대화별 실행 모드 복원
       // 대화별 작업 폴더 복원
       if (conv && conv.cwd) {
@@ -10085,6 +10202,7 @@ ${userPrompt}
       $subagentRail.innerHTML = '';
       return;
     }
+    applySubagentRailWidth();
 
     const statusRank = { running: 0, pending: 1, error: 2, completed: 3 };
     const orderedPanels = panels.slice().sort((a, b) => {
