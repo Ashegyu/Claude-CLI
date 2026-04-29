@@ -49,6 +49,17 @@
           </svg>
           새 프로젝트
         </button>
+        <div class="sidebar-search">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="search-icon">
+            <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" id="sidebar-search-input" placeholder="대화 제목 검색..." autocomplete="off">
+          <button id="btn-sidebar-search-clear" class="search-clear-btn hidden" title="검색어 지우기">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
       </div>
 
       <!-- 프로필 선택 -->
@@ -76,6 +87,7 @@
 
       <!-- 사이드바 하단 -->
       <div id="sidebar-bottom">
+        <div id="codex-statusbar" aria-live="polite"></div>
         <button id="btn-clear-all" class="sidebar-btn muted-btn">대화 기록 삭제</button>
         <div class="sidebar-meta">
           <button id="btn-user-manual" class="sidebar-link-btn" type="button">사용 설명서</button>
@@ -156,9 +168,28 @@
           <button id="btn-subagent-autoclose" class="runtime-hint runtime-select-btn subagent-autoclose-btn" type="button" title="서브에이전트는 현재 대화에 분할 패널로 표시됩니다">에이전트: 현재창</button>
         </div>
         <div id="runtime-selector-menu" class="hidden" role="listbox" aria-label="런타임 설정 선택"></div>
-        <div id="codex-statusbar" aria-live="polite"></div>
       </div>
     </section>
+  </div>
+
+  <!-- 커맨드 팔레트 -->
+  <div id="command-palette" class="palette-overlay hidden">
+    <div class="palette-window">
+      <div class="palette-search-wrapper">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="palette-search-icon">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <input type="text" id="palette-input" placeholder="명령어 또는 대화 검색... (Esc로 닫기)" autocomplete="off">
+      </div>
+      <div id="palette-results" class="palette-results">
+        <!-- 결과 항목이 동적으로 삽입됨 -->
+      </div>
+      <div class="palette-footer">
+        <span><kbd>↑↓</kbd> 이동</span>
+        <span><kbd>Enter</kbd> 선택</span>
+        <span><kbd>Esc</kbd> 닫기</span>
+      </div>
+    </div>
   </div>
 
   <!-- marked (UMD) - highlight.js는 preload에서 로드 -->

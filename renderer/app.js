@@ -718,6 +718,8 @@
   function renderDiffCodeBlock(text, parsedLang) {
     const rawText = String(text || '');
     const lines = rawText.split(/\r?\n/);
+    const lineCount = lines.length;
+    const isCollapsible = lineCount > 40;
     const lineState = { oldLine: null, newLine: null };
     const diffLinesHtml = lines.map((rawLine) => {
       const { className, sign, text: body, lineNumber } = classifyDiffLineForRender(rawLine, lineState);
@@ -732,7 +734,14 @@
         <span class="code-lang">${escapeHtml(langLabel)}</span>
         <button class="code-copy-btn" data-action="copy" data-raw-code="${rawCodeAttr}">복사</button>
       </div>
-      <pre><code class="hljs">${diffLinesHtml}</code></pre>
+      <div class="code-content-container ${isCollapsible ? 'collapsed' : ''}">
+        <pre><code class="hljs">${diffLinesHtml}</code></pre>
+        ${isCollapsible ? `
+          <div class="code-expand-overlay">
+            <button class="btn-expand-code">더 보기 (${lineCount}줄)</button>
+          </div>
+        ` : ''}
+      </div>
     </div>`;
   }
 
@@ -743,6 +752,9 @@
       : String(codeOrToken?.text || '');
     const rawLang = typeof codeOrToken === 'string' ? maybeLang : codeOrToken?.lang;
     const parsedLang = normalizeCodeLanguage(rawLang);
+    const lineCount = (text.match(/\n/g) || []).length + 1;
+    const isCollapsible = lineCount > 40;
+
     if (isLikelyDiffCodeBlock(text, parsedLang)) {
       return renderDiffCodeBlock(text, parsedLang || 'diff');
     }
@@ -752,12 +764,24 @@
     const langLabel = language || 'code';
     const langClass = language ? ` language-${language.replace(/[^a-z0-9_-]/gi, '')}` : '';
     const rawCodeAttr = encodeURIComponent(String(text || ''));
+    const isExecutable = language === 'javascript' || language === 'python';
+
     return `<div class="code-block-wrapper">
       <div class="code-block-header">
         <span class="code-lang">${escapeHtml(langLabel)}</span>
-        <button class="code-copy-btn" data-action="copy" data-raw-code="${rawCodeAttr}">복사</button>
+        <div class="code-actions">
+          ${isExecutable ? `<button class="code-action-btn btn-run-code" data-action="run" data-lang="${escapeHtml(language)}" data-raw-code="${rawCodeAttr}">실행</button>` : ''}
+          <button class="code-copy-btn" data-action="copy" data-raw-code="${rawCodeAttr}">복사</button>
+        </div>
       </div>
-      <pre><code class="hljs${langClass}">${highlighted}</code></pre>
+      <div class="code-content-container ${isCollapsible ? 'collapsed' : ''}">
+        <pre><code class="hljs${langClass}">${highlighted}</code></pre>
+        ${isCollapsible ? `
+          <div class="code-expand-overlay">
+            <button class="btn-expand-code">더 보기 (${lineCount}줄)</button>
+          </div>
+        ` : ''}
+      </div>
     </div>`;
   };
 
@@ -847,6 +871,7 @@
   let currentCwd = '';
   let selectedProjectCwd = '';
   let runtimeMenuType = '';
+  let sidebarSearchQuery = '';
 
   // 대화별 스트리밍 상태: convId → { streamId, unsubStream, unsubDone, unsubError, elapsedTimer }
   const convStreams = new Map();
@@ -914,6 +939,150 @@
   const $appVersion = document.getElementById('app-version');
   const $btnUserManual = document.getElementById('btn-user-manual');
   const $btnCodexSettings = document.getElementById('btn-codex-settings');
+  const $sidebarSearchInput = document.getElementById('sidebar-search-input');
+  const $btnSidebarSearchClear = document.getElementById('btn-sidebar-search-clear');
+  const $commandPalette = document.getElementById('command-palette');
+  const $paletteInput = document.getElementById('palette-input');
+  const $paletteResults = document.getElementById('palette-results');
+
+  let paletteActiveIndex = 0;
+  let paletteItems = [];
+
+  function openCommandPalette() {
+    $commandPalette?.classList.remove('hidden');
+    $paletteInput?.focus();
+    if ($paletteInput) $paletteInput.value = '';
+    renderPaletteResults();
+  }
+
+  function closeCommandPalette() {
+    $commandPalette?.classList.add('hidden');
+    $input?.focus();
+  }
+
+  function renderPaletteResults() {
+    if (!$paletteResults) return;
+    const query = String($paletteInput?.value || '').trim().toLowerCase();
+    
+    // 1. 명령어 목록 모으기
+    const cmdItems = SLASH_COMMANDS.map(cmd => ({
+      type: 'command',
+      id: cmd.name,
+      title: `/${cmd.name}`,
+      desc: cmd.description,
+      icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>'
+    }));
+
+    // 2. 최근 대화 목록 모으기 (최대 20개)
+    const convItems = conversations.slice(0, 20).map(c => ({
+      type: 'conversation',
+      id: c.id,
+      title: c.title || '새 대화',
+      desc: c.cwd || '워크스페이스 미지정',
+      icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>'
+    }));
+
+    paletteItems = [...cmdItems, ...convItems];
+
+    if (query) {
+      paletteItems = paletteItems.filter(item => 
+        item.title.toLowerCase().includes(query) || 
+        item.desc.toLowerCase().includes(query)
+      );
+    }
+
+    if (paletteItems.length === 0) {
+      $paletteResults.innerHTML = '<div class="palette-item-empty">검색 결과가 없습니다.</div>';
+      return;
+    }
+
+    paletteActiveIndex = Math.min(paletteActiveIndex, paletteItems.length - 1);
+    if (paletteActiveIndex < 0) paletteActiveIndex = 0;
+
+    $paletteResults.innerHTML = paletteItems.map((item, idx) => `
+      <div class="palette-item ${idx === paletteActiveIndex ? 'active' : ''}" data-index="${idx}">
+        <div class="palette-item-icon">${item.icon}</div>
+        <div class="palette-item-content">
+          <div class="palette-item-title">${escapeHtml(item.title)}</div>
+          <div class="palette-item-desc">${escapeHtml(item.desc)}</div>
+        </div>
+        <div class="palette-item-type">${item.type}</div>
+      </div>
+    `).join('');
+
+    // 활성 항목 스크롤 보정
+    const activeEl = $paletteResults.querySelector('.palette-item.active');
+    activeEl?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function executePaletteItem(item) {
+    if (!item) return;
+    if (item.type === 'command') {
+      if ($input) {
+        $input.value = `/${item.id} `;
+        $input.focus();
+      }
+    } else if (item.type === 'conversation') {
+      loadConversation(item.id);
+    }
+    closeCommandPalette();
+  }
+
+  // Event Listeners for Palette
+  window.addEventListener('keydown', (e) => {
+    // Ctrl+K or Ctrl+P
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'p')) {
+      e.preventDefault();
+      openCommandPalette();
+    }
+    
+    if (!$commandPalette?.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        closeCommandPalette();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        paletteActiveIndex = (paletteActiveIndex + 1) % paletteItems.length;
+        renderPaletteResults();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        paletteActiveIndex = (paletteActiveIndex - 1 + paletteItems.length) % paletteItems.length;
+        renderPaletteResults();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        executePaletteItem(paletteItems[paletteActiveIndex]);
+      }
+    }
+  });
+
+  $paletteInput?.addEventListener('input', () => {
+    paletteActiveIndex = 0;
+    renderPaletteResults();
+  });
+
+  $paletteResults?.addEventListener('click', (e) => {
+    const itemEl = e.target.closest('.palette-item');
+    if (itemEl) {
+      const idx = parseInt(itemEl.dataset.index);
+      executePaletteItem(paletteItems[idx]);
+    }
+  });
+
+  $commandPalette?.addEventListener('click', (e) => {
+    if (e.target === $commandPalette) closeCommandPalette();
+  });
+
+  function handleSidebarSearch() {
+    sidebarSearchQuery = String($sidebarSearchInput?.value || '').trim().toLowerCase();
+    $btnSidebarSearchClear?.classList.toggle('hidden', !sidebarSearchQuery);
+    renderProjects();
+  }
+
+  $sidebarSearchInput?.addEventListener('input', handleSidebarSearch);
+  $btnSidebarSearchClear?.addEventListener('click', () => {
+    if ($sidebarSearchInput) $sidebarSearchInput.value = '';
+    handleSidebarSearch();
+    $sidebarSearchInput?.focus();
+  });
 
   const SLASH_COMMANDS = [
     // --- Codex 실행 ---
@@ -4604,18 +4773,44 @@
     if (!$projectList) return;
 
     const activeKey = getProjectPathKey(getSelectedProjectPath());
-    if (projectPaths.length === 0) {
+    let displayProjectPaths = projectPaths;
+
+    // 검색 필터 적용
+    if (sidebarSearchQuery) {
+      const matchedConvs = conversations.filter(c =>
+        (c.title || '새 대화').toLowerCase().includes(sidebarSearchQuery)
+      );
+      const matchedCwdKeys = new Set(matchedConvs.map(c => getProjectPathKey(c.cwd)));
+      displayProjectPaths = projectPaths.filter(p => matchedCwdKeys.has(getProjectPathKey(p)));
+
+      if (displayProjectPaths.length === 0) {
+        $projectList.innerHTML = `<div class="project-empty">"${escapeHtml(sidebarSearchQuery)}"와 일치하는 대화가 없습니다.</div>`;
+        return;
+      }
+    }
+
+    if (displayProjectPaths.length === 0) {
       $projectList.innerHTML = '<div class="project-empty">새 프로젝트를 열어 작업 폴더를 추가하세요.</div>';
     } else {
-      $projectList.innerHTML = projectPaths.map((projectPath) => {
+      $projectList.innerHTML = displayProjectPaths.map((projectPath) => {
         const encodedPath = encodeURIComponent(projectPath);
         const projectKey = getProjectPathKey(projectPath);
         const displayName = _cwdDisplayName(projectPath);
-        const conversationsForProject = getProjectConversations(projectPath);
-        const count = getProjectConversationCount(projectPath);
+
+        // 검색 시 해당 프로젝트 내에서도 필터링된 대화만 표시
+        let conversationsForProject = getProjectConversations(projectPath);
+        if (sidebarSearchQuery) {
+          conversationsForProject = conversationsForProject.filter(c =>
+            (c.title || '새 대화').toLowerCase().includes(sidebarSearchQuery)
+          );
+        }
+
+        const count = conversationsForProject.length;
         const isActive = activeKey && getProjectPathKey(projectPath) === activeKey;
         const isEditingProject = conversationsForProject.some(conv => conv.id === historyEditingId);
-        const isCollapsed = isEditingProject ? false : isProjectCollapsed(projectPath);
+
+        // 검색 중일 때는 결과 확인을 위해 강제로 펼침
+        const isCollapsed = sidebarSearchQuery ? false : (isEditingProject ? false : isProjectCollapsed(projectPath));
         const chevron = isCollapsed ? '▸' : '▾';
         const conversationsHtml = isCollapsed
           ? ''
@@ -4623,7 +4818,7 @@
             <div class="project-conversations">
               ${conversationsForProject.length > 0
                 ? conversationsForProject.map(c => _renderConvItem(c)).join('')
-                : '<div class="project-conversations-empty">이 프로젝트에는 아직 대화가 없습니다.</div>'}
+                : '<div class="project-conversations-empty">일치하는 대화가 없습니다.</div>'}
             </div>
           `;
         return `
@@ -10336,6 +10531,45 @@ ${userPrompt}
     return panel.status === 'running' ? 'Codex' : 'Result';
   }
 
+  function detectSubagentPhase(panel) {
+    const lines = (Array.isArray(panel.progressLines) ? panel.progressLines : []).join('\n').toLowerCase();
+    const current = (panel.currentActivity || '').toLowerCase();
+    const all = lines + '\n' + current;
+
+    if (panel.status === 'completed') return 3;
+    if (all.includes('test') || all.includes('verify') || all.includes('check') || all.includes('validate') || all.includes('eval')) return 3;
+    if (all.includes('replace') || all.includes('write') || all.includes('apply') || all.includes('edit') || all.includes('update') || all.includes('implement')) return 2;
+    if (all.includes('strategy') || all.includes('plan') || all.includes('formulate') || all.includes('thought')) return 1;
+    return 0; // Research
+  }
+
+  function renderStepper(currentPhase, isCompleted) {
+    const phases = [
+      { id: 0, label: 'Research' },
+      { id: 1, label: 'Strategy' },
+      { id: 2, label: 'Execute' },
+      { id: 3, label: 'Verify' }
+    ];
+
+    return `
+      <div class="subagent-stepper">
+        ${phases.map(p => {
+          let state = '';
+          if (isCompleted) state = 'completed';
+          else if (p.id < currentPhase) state = 'completed';
+          else if (p.id === currentPhase) state = 'active';
+          
+          return `
+            <div class="step-item ${state}">
+              <div class="step-circle">${state === 'completed' ? '✓' : p.id + 1}</div>
+              <div class="step-label">${p.label}</div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `;
+  }
+
   function renderSubagentRailCard(msg) {
     const panel = normalizeSubagentPanel(msg?.subagentPanel);
     if (!panel) return '';
@@ -10351,6 +10585,9 @@ ${userPrompt}
     const toolLabel = getSubagentRailToolLabel(panel);
     const currentActivity = getSubagentCurrentActivity(panel);
     const processTimelineHtml = renderSubagentProgressTimeline(panel);
+    
+    const currentPhase = detectSubagentPhase(panel);
+    const stepperHtml = renderStepper(currentPhase, panel.status === 'completed');
 
     return `<article class="subagent-rail-card subagent-${status.className}" data-subagent-msg-id="${escapeHtml(msg.id || '')}">
       <header class="subagent-rail-header">
@@ -10361,6 +10598,7 @@ ${userPrompt}
         </div>
         <span class="subagent-rail-status">${escapeHtml(status.label)}</span>
       </header>
+      ${stepperHtml}
       <div class="subagent-rail-tool">
         <span class="subagent-rail-tool-mark" aria-hidden="true"></span>
         <span>${escapeHtml(toolLabel)}</span>
@@ -12096,6 +12334,52 @@ ${userPrompt}
       }
     });
   }
+
+  // 메시지 영역 클릭 이벤트 위임 (코드 복사, 실행, 더 보기)
+  $messages?.addEventListener('click', (e) => {
+    // 1. 코드 복사
+    const btnCopy = e.target.closest('.code-copy-btn');
+    if (btnCopy) {
+      const rawCode = decodeURIComponent(btnCopy.dataset.rawCode || '');
+      if (rawCode) {
+        navigator.clipboard.writeText(rawCode).then(() => {
+          const originalText = btnCopy.innerText;
+          btnCopy.innerText = '복사됨!';
+          btnCopy.classList.add('copied');
+          setTimeout(() => {
+            btnCopy.innerText = originalText;
+            btnCopy.classList.remove('copied');
+          }, 2000);
+        });
+      }
+      return;
+    }
+
+    // 2. 코드 실행
+    const btnRun = e.target.closest('.btn-run-code');
+    if (btnRun) {
+      const rawCode = decodeURIComponent(btnRun.dataset.rawCode || '');
+      const lang = btnRun.dataset.lang;
+      if (rawCode && $input) {
+        const runCmd = lang.includes('py') ? '/run python' : '/run node';
+        $input.value = `${runCmd}\n\`\`\`${lang}\n${rawCode}\n\`\`\``;
+        $input.focus();
+        // UI 힌트 추가
+        showSlashFeedback(`코드 실행 준비 완료. Enter를 눌러 실행하세요.`);
+      }
+      return;
+    }
+
+    // 3. 코드 더 보기 (펼치기)
+    const btnExpand = e.target.closest('.btn-expand-code');
+    if (btnExpand) {
+      const container = btnExpand.closest('.code-content-container');
+      if (container) {
+        container.classList.remove('collapsed');
+      }
+      return;
+    }
+  });
 
   // 사용자가 스크롤을 조작하면 자동 하단 고정 상태를 갱신 + 맨 위로 버튼 표시
   const $scrollTopBtn = document.getElementById('btn-scroll-top');

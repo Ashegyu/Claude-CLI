@@ -76,7 +76,9 @@
       "Bash(cp \"C:/Users/GC/Desktop/Works/Personal/Claude CLI/.codex/agents/\"*.toml \"C:/Users/GC/.codex/agents/\")",
       "Read(//c/Users/GC/.codex/agents/**)",
       "Bash(python3 -c \":*)",
-      "Bash(node -e \":*)"
+      "Bash(node -e \":*)",
+      "Bash(git checkout *)",
+      "Bash(rtk git *)"
     ]
   }
 }
